@@ -50,6 +50,8 @@ namespace mq
             if (ret == false)
             {
                 DLOG("打开信道失败！");
+                // 打开失败时不要把半初始化的信道留在管理器里。
+                _channel_manager->remove(channel->cid());
                 return Channel::ptr();
             }
             return channel;

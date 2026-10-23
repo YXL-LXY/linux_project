@@ -189,7 +189,9 @@ ctest --test-dir build -R mq_routetest --output-on-failure
 - `basicPublish` / `basicConsume` / `basicCancel` / `basicAck`
 - 消息落盘：SQLite 保存元数据，`.mqd` 文件保存消息体
 - 未确认消息（wait-ack）与确认后回收
-- 服务端线程池异步投递消息
+- 无消费者时消息保留在队列中，不会先取出再卡在 wait-ack
+- 服务端线程池任务和消费者回调使用 `weak_ptr`，避免 Channel 析构后的悬空指针
+- 客户端请求等待响应最多 5 秒，超时返回失败而不是永久阻塞
 - GoogleTest 单元测试与 CTest 集成
 
 ## 已知限制
@@ -203,6 +205,7 @@ ctest --test-dir build -R mq_routetest --output-on-failure
 - **没有大包零拷贝 / 共享内存**：消息体统一走 protobuf 和 TCP。
 - **没有 ROS2 bridge**：还没有和 `rclcpp` 的 QoS 做映射。
 - **没有监控面板**：没有 Prometheus / Grafana，只有日志。
+- **请求超时不等于请求没执行**：客户端 5 秒没收到响应会返回失败，但服务端可能已经处理了请求。
 - **没有 TLS、鉴权、权限控制**：默认只适合本地学习。
 - **muduo 是预编译静态库**：换架构需要自行重新编译。
 
@@ -210,12 +213,9 @@ ctest --test-dir build -R mq_routetest --output-on-failure
 
 按优先级建议继续做：
 
-1. 修复“没有消费者时消息卡在 wait-ack”的问题
-2. 消费任务捕获 `weak_ptr`，消除 `Channel` 关闭后的 use-after-free
-3. 客户端 `waitResponse` 增加超时，避免网络抖动时永久阻塞
-4. 实现 latched topic：新消费者订阅时投递队列中的历史消息
-5. 用 `x-max-length` 实现 `KEEP_LAST` 有界队列
-6. 写一个 100Hz IMU + 大包图像的 demo，并补一张吞吐/延迟表
+1. 实现 latched topic：新消费者订阅时投递队列中的历史消息
+2. 用 `x-max-length` 实现 `KEEP_LAST` 有界队列
+3. 写一个 100Hz IMU + 大包图像的 demo，并补一张吞吐/延迟表
 
 ## License
 

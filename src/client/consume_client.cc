@@ -18,6 +18,11 @@ int main(int argc, char *argv[])
     mq::Connection::ptr conn = std::make_shared<mq::Connection>("127.0.0.1", 8085, awp);
     //3. 通过连接创建信道
     mq::Channel::ptr channel = conn->openChannel();
+    if (!channel)
+    {
+        std::cerr << "打开信道失败，请确认 mqserver 已启动并监听 8085 端口" << std::endl;
+        return -1;
+    }
     //4. 通过信道提供的服务完成所需
     //  1. 声明一个交换机exchange1, 交换机类型为广播模式
     google::protobuf::Map<std::string, std::string> tmp_map;

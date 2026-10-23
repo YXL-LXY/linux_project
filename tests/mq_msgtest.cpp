@@ -84,8 +84,7 @@ int main(int argc,char *argv[])
 {
     testing::InitGoogleTest(&argc, argv);
     testing::AddGlobalTestEnvironment(new MessageTest);
-    RUN_ALL_TESTS();
-    return 0;
+    return RUN_ALL_TESTS();
 }
 
 

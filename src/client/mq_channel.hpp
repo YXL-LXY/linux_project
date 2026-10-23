@@ -11,6 +11,7 @@
 #include <iostream>
 #include <mutex>
 #include <condition_variable>
+#include <chrono>
 #include <unordered_map>
 
 namespace mq
@@ -24,7 +25,7 @@ namespace mq
     public:
         using ptr = std::shared_ptr<Channel>;
         Channel(const muduo::net::TcpConnectionPtr &conn, const ProtobufCodecPtr &codec) : _cid(UUIDHelper::uuid()), _conn(conn), _codec(codec) {}
-        ~Channel() {basicCancel();}
+        ~Channel() { basicCancel(); }
         std::string cid() { return _cid; }
         bool openChannel()
         {
@@ -33,8 +34,7 @@ namespace mq
             req.set_rid(rid);
             req.set_cid(_cid);
             _codec->send(_conn, req);
-            basicCommonResponsePtr resp = waitResponse(rid);
-            return resp->ok();
+            return waitResponseOk(rid, "打开信道");
         }
         void closeChannel()
         {
@@ -43,7 +43,7 @@ namespace mq
             req.set_rid(rid);
             req.set_cid(_cid);
             _codec->send(_conn, req);
-            waitResponse(rid);
+            waitResponseOk(rid, "关闭信道");
             return;
         }
         bool declareExchange(
@@ -65,10 +65,8 @@ namespace mq
             req.mutable_args()->swap(args);
             // 然后向服务器发送请求
             _codec->send(_conn, req);
-            // 等待服务器的响应
-            basicCommonResponsePtr resp = waitResponse(rid);
-            // 返回
-            return resp->ok();
+            // 等待服务器的响应（超时返回 false）
+            return waitResponseOk(rid, "声明交换机");
         }
         void deleteExchange(const std::string &name)
         {
@@ -78,7 +76,7 @@ namespace mq
             req.set_cid(_cid);
             req.set_exchange_name(name);
             _codec->send(_conn, req);
-            waitResponse(rid);
+            waitResponseOk(rid, "删除交换机");
             return;
         }
 
@@ -99,8 +97,7 @@ namespace mq
             req.set_exclusive(qexclusive);
             req.mutable_args()->swap(qargs);
             _codec->send(_conn, req);
-            basicCommonResponsePtr resp = waitResponse(rid);
-            return resp->ok();
+            return waitResponseOk(rid, "声明队列");
         }
         void deleteQueue(const std::string &qname)
         {
@@ -110,7 +107,7 @@ namespace mq
             req.set_cid(_cid);
             req.set_queue_name(qname);
             _codec->send(_conn, req);
-            waitResponse(rid);
+            waitResponseOk(rid, "删除队列");
             return;
         }
 
@@ -127,8 +124,7 @@ namespace mq
             req.set_queue_name(qname);
             req.set_binding_key(key);
             _codec->send(_conn, req);
-            basicCommonResponsePtr resp = waitResponse(rid);
-            return resp->ok();
+            return waitResponseOk(rid, "绑定队列");
         }
         void queueUnBind(const std::string &ename, const std::string &qname)
         {
@@ -139,7 +135,7 @@ namespace mq
             req.set_exchange_name(ename);
             req.set_queue_name(qname);
             _codec->send(_conn, req);
-            waitResponse(rid);
+            waitResponseOk(rid, "解绑队列");
             return;
         }
 
@@ -161,7 +157,7 @@ namespace mq
                 req.mutable_properties()->set_routing_key(bp->routing_key());
             }
             _codec->send(_conn, req);
-            waitResponse(rid);
+            waitResponseOk(rid, "发布消息");
             return;
         }
 
@@ -179,7 +175,7 @@ namespace mq
             req.set_queue_name(_consumer->qname);
             req.set_message_id(msgid);
             _codec->send(_conn, req);
-            waitResponse(rid);
+            waitResponseOk(rid, "确认消息");
             return;
         }
 
@@ -196,7 +192,7 @@ namespace mq
             req.set_queue_name(_consumer->qname);
             req.set_consumer_tag(_consumer->tag);
             _codec->send(_conn, req);
-            waitResponse(rid);
+            waitResponseOk(rid, "取消订阅");
             _consumer.reset();
             return;
         }
@@ -220,10 +216,9 @@ namespace mq
             req.set_consumer_tag(consumer_tag);
             req.set_auto_ack(auto_ack);
             _codec->send(_conn, req);
-            basicCommonResponsePtr resp = waitResponse(rid);
-            if (resp->ok() == false)
+            if (waitResponseOk(rid, "订阅队列") == false)
             {
-                DLOG("添加订阅失败！");
+                DLOG("添加订阅失败或等待响应超时！");
                 return false;
             }
             _consumer = std::make_shared<Consumer>(consumer_tag, queue_name, auto_ack, cb);
@@ -256,15 +251,31 @@ namespace mq
         }
 
     private:
+        // 等待响应并检查服务端返回的 ok 字段；超时会记录日志并返回 false。
+        bool waitResponseOk(const std::string &rid, const char *action)
+        {
+            basicCommonResponsePtr resp = waitResponse(rid);
+            if (!resp)
+            {
+                DLOG("%s：等待服务器响应超时", action);
+                return false;
+            }
+            return resp->ok();
+        }
+
+        // 最多等待 5 秒，避免网络抖动时永久阻塞。
         basicCommonResponsePtr waitResponse(const std::string &rid)
         {
             std::unique_lock<std::mutex> lock(_mutex);
-            _cv.wait(lock, [&rid, this]()
-                     { return _basic_resp.find(rid) != _basic_resp.end(); });
-            // while(condition()) _cv.wait();
-            basicCommonResponsePtr basic_resp = _basic_resp[rid];
+            auto ok = _cv.wait_for(lock, std::chrono::seconds(5), [&rid, this]()
+                                   { return _basic_resp.count(rid) > 0; });
+            if (!ok)
+            {
+                return nullptr;
+            }
+            auto resp = _basic_resp[rid];
             _basic_resp.erase(rid);
-            return basic_resp;
+            return resp;
         }
 
     private:

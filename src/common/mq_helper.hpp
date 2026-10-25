@@ -21,6 +21,12 @@ namespace mq
     public:
         typedef int (*SqliteCallback)(void *, int, char **, char **);
         SqliteHelper(const std::string &dbfile) : _dbfile(dbfile), _handler(nullptr) {}
+        ~SqliteHelper()
+        {
+            close();
+        }
+        SqliteHelper(const SqliteHelper &) = delete;
+        SqliteHelper &operator=(const SqliteHelper &) = delete;
         bool open(int safe_leve = SQLITE_OPEN_FULLMUTEX) // 串形化安全等级
         {
             // int sqlite3_open_v2(const char *filename, sqlite3 **ppDb, int flags, const char *zVfs );
@@ -47,7 +53,10 @@ namespace mq
         {
             // int sqlite3_close_v2(sqlite3*);
             if (_handler)
+            {
                 sqlite3_close_v2(_handler);
+                _handler = nullptr;
+            }
         }
 
     private:

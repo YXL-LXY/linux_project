@@ -32,12 +32,14 @@
 publish
   └─▶ Exchange ──(routing key)──▶ Binding ──▶ Queue
                                                 │
-                          basicConsume ◀────────┘
-                                │
-                                ▼
-                          consumer callback
-                                │
-                            basicAck
+                                       QueueDispatcher
+                                                │  多个消费者轮转竞争 + prefetch 限制
+                                                ▼
+                                       consumer callback
+                                                │
+                                 basicAck / basicReject
+                                                │
+                             ACK 超时扫描 → 重投 / 死信队列
 ```
 
 支持三种交换机：
@@ -142,6 +144,20 @@ protobuf 的 `.pb.cc/.pb.h` 在构建时生成到 `build/`，不提交到仓库�
 ./build/bin/consume_client queue2
 ```
 
+同一个队列可以启动多个消费者，用不同的 consumer tag 分摊消息：
+
+```bash
+./build/bin/consume_client queue2 consumer-A
+./build/bin/consume_client queue2 consumer-B
+```
+
+第三个可选参数是 prefetch：每个消费者最多同时持有多少条未 ACK 消息。
+
+```bash
+# 每个消费者同一时间最多处理 1 条，ACK 后才继续投递
+./build/bin/consume_client queue2 consumer-A 1
+```
+
 终端 3：发布消息
 
 ```bash
@@ -163,6 +179,54 @@ consumer1消费了消息：Hello Bite
 - `queue1` 的 binding key 是 `queue1`
 - `queue2` 的 binding key 是 `news.music.#`
 - `publish_client` 使用的 routing key 是 `news.music.pop`，所以消息会进入 `queue2`
+
+## QoS、失败重投和死信
+
+`basicQos(prefetch_count)` 是信道级设置，作用于该信道上的消费者：
+
+- `0`：不限制（默认）
+- `N > 0`：消费者最多同时持有 N 条未 ACK 消息；达到上限后，`QueueDispatcher` 会跳过它，把消息投给其他还有额度的消费者
+- ACK、`basicReject` 或 ACK 超时归还名额后，队列会被重新唤醒
+
+消费端处理失败时调用：
+
+```cpp
+// 重新入队，等待再次投递
+channel->basicReject(message_id, true);
+
+// 不再重投：有死信交换机就进入死信队列，否则直接丢弃
+channel->basicReject(message_id, false);
+```
+
+队列支持这些参数：
+
+| 参数 | 含义 |
+| --- | --- |
+| `x-max-length` | 就绪消息上限，超出时丢弃最旧的 |
+| `x-ack-timeout-ms` | 等待 ACK 的毫秒数，默认 `30000`；`0` 表示关闭超时 |
+| `x-max-delivery-count` | 最多投递次数；达到后 `requeue=true` 也会转死信；未设置表示不限制 |
+| `x-dead-letter-exchange` | 死信交换机名；未设置时拒绝/超时的消息直接丢弃 |
+| `x-dead-letter-routing-key` | 可选，死信路由 key；不设置时沿用原消息的 routing key |
+
+服务端每秒扫描一次 wait-ack。超时消息会按原投递顺序重新入队，`delivery_count` 加一；
+如果达到 `x-max-delivery-count`，则按死信交换机路由。死信消息进入目标队列后，
+`delivery_count` 会重置为 0。
+
+`BasicProperties.delivery_count` 会随消息一起推送给消费者，消费端可以据此判断是否已经重投过。
+当前 `delivery_count` 是运行时计数，服务重启后从 0 开始；消息本身仍会持久化。
+
+示例：
+
+```cpp
+google::protobuf::Map<std::string, std::string> args;
+args["x-max-length"] = "1000";
+args["x-ack-timeout-ms"] = "5000";
+args["x-max-delivery-count"] = "3";
+args["x-dead-letter-exchange"] = "dlx";
+args["x-dead-letter-routing-key"] = "dead";
+channel->declareQueue("task_queue", true, false, false, args);
+channel->basicQos(1);
+```
 
 ## 测试
 
@@ -186,11 +250,18 @@ ctest --test-dir build -R mq_routetest --output-on-failure
 - `Exchange` 的声明、删除，支持 `DIRECT` / `FANOUT` / `TOPIC`
 - `Queue` 的声明、删除，支持持久化元数据
 - `Binding` 的绑定 / 解绑与 routing key 匹配
-- `basicPublish` / `basicConsume` / `basicCancel` / `basicAck`
+- `basicPublish` / `basicConsume` / `basicCancel` / `basicAck` / `basicQos` / `basicReject`
+- 队列采用 RabbitMQ 式竞争消费：同一队列的多个消费者按轮转分摊消息，每条消息只投递给其中一个消费者；新消费者不会把历史消息“独占补发”一遍
+- `QueueDispatcher` 按队列合并唤醒：发布、订阅、确认、拒绝、超时后触发正常 drain；每批最多处理 100 条，剩余消息重新排队，避免大队列长期占用单工作线程
+- `basicQos` 支持 prefetch：消费者达到在途消息上限后会被跳过，ACK/拒绝/超时后恢复投递
+- 消费失败可用 `basicReject(requeue)` 重新入队或转入死信；`delivery_count` 随消息传递
+- 消费者断线或 `basicCancel` 时，未 ACK 消息按原投递顺序重新入队，等待其他/后续消费者
+- 服务端每秒扫描一次 ACK 超时；超时消息自动重投，达到 `x-max-delivery-count` 后进入死信交换机
 - 消息落盘：SQLite 保存元数据，`.mqd` 文件保存消息体
 - 未确认消息（wait-ack）与确认后回收
 - 无消费者时消息保留在队列中，不会先取出再卡在 wait-ack
-- 服务端线程池任务和消费者回调使用 `weak_ptr`，避免 Channel 析构后的悬空指针
+- 支持队列参数 `x-max-length`、`x-ack-timeout-ms`、`x-max-delivery-count`、`x-dead-letter-exchange`、`x-dead-letter-routing-key`；durable 队列会随元数据持久化这些参数
+- 消费者回调使用 `weak_ptr`，避免 Channel 析构后的悬空指针；调度任务持有 dispatcher 的 `shared_ptr`，线程池使用 `weak_ptr` 避免循环引用
 - 客户端请求等待响应最多 5 秒，超时返回失败而不是永久阻塞
 - GoogleTest 单元测试与 CTest 集成
 
@@ -199,9 +270,12 @@ ctest --test-dir build -R mq_routetest --output-on-failure
 这些是刻意保留的边界，不是“忘了做”：
 
 - **没有 Publisher Confirm / mandatory / return**：发布端无法确认 broker 是否收到消息。
-- **没有 prefetch / QoS**：服务端会尽可能快地把消息推给消费者。
-- **没有重投、死信队列、去重**：消费失败或超时后不会自动重新入队。
-- **没有 latched / 历史消息回放**：新订阅者只能收到订阅之后发布的消息。
+- **只实现了单条 `basicReject`**：没有 `basicNack(multiple)`，也不支持批量确认；消费端需要自己记录失败消息 id。
+- **ACK 超时和死信是 at-least-once**：超时/断线都会重投，不是 exactly-once；消费端仍需要保证操作幂等。
+- **`delivery_count` 没有持久化**：它保存在消息运行时属性里，服务重启后会从 0 开始；持久化消息体会恢复，但重投次数不会。
+- **没有 latched / retained 语义**：队列是“消费即出队”的工作队列，不会为每个新订阅者保留最近一条或最近 N 条副本。ROS2 latched topic 这类“最新状态”需求应放到未来的 bridge 中用 retained-state 缓存实现，而不是把队列改成回放日志。
+- **`x-max-length` 只约束待推送消息**：已经被消费者取走但尚未 ACK 的消息不计入上限，所以消费者长期不 ACK 时，队列里的消息总量仍可能超过上限。
+- **死信配置要避免环路**：如果死信交换机又把消息路由回源队列，可能形成反复投递；当前没有死信跳数/循环检测。
 - **没有大包零拷贝 / 共享内存**：消息体统一走 protobuf 和 TCP。
 - **没有 ROS2 bridge**：还没有和 `rclcpp` 的 QoS 做映射。
 - **没有监控面板**：没有 Prometheus / Grafana，只有日志。
@@ -213,9 +287,10 @@ ctest --test-dir build -R mq_routetest --output-on-failure
 
 按优先级建议继续做：
 
-1. 实现 latched topic：新消费者订阅时投递队列中的历史消息
-2. 用 `x-max-length` 实现 `KEEP_LAST` 有界队列
-3. 写一个 100Hz IMU + 大包图像的 demo，并补一张吞吐/延迟表
+1. 把 retained-state（最近状态）、ROS2 QoS 映射和 topic/service 桥接放到独立的 bridge 进程；broker 继续保持 ROS2 无关
+2. 写一个 100Hz IMU + 大包图像的 demo，并补一张吞吐/延迟表
+3. 可选：补监控指标（队列深度、消费者数、未确认数、超时/死信计数）
+4. 可选：补 `basicNack(multiple)`、Publisher Confirm 和更有针对性的持久化重投计数
 
 ## License
 

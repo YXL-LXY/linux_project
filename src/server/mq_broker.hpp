@@ -12,6 +12,7 @@
 #include "common/mq_logger.hpp"
 #include "mq_connection.hpp"
 #include "mq_consumer.hpp"
+#include "mq_dispatcher.hpp"
 #include "mq_host.hpp"
 
 namespace mq
@@ -31,7 +32,9 @@ namespace mq
                                                        _virtual_host(std::make_shared<VirtualHost>(HOSTNAME, basedir, basedir + DBFILE)),
                                                        _consumer_manager(std::make_shared<ConsumerManager>()),
                                                        _connection_manager(std::make_shared<ConnectionManager>()),
-                                                       _threadpool(std::make_shared<threadpool>())
+                                                       _threadpool(std::make_shared<threadpool>()),
+                                                       _queue_dispatcher(std::make_shared<QueueDispatcher>(
+                                                           _virtual_host, _consumer_manager, _threadpool))
         {
             // 针对历史消息中的所有队列，别忘了，初始化队列的消费者管理结构
             QueueMap qm = _virtual_host->allQueues();
@@ -60,6 +63,10 @@ namespace mq
                                                                                    std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
             _dispatcher.registerMessageCallback<mq::basicAckRequest>(std::bind(&Server::onBasicAck, this,
                                                                                std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+            _dispatcher.registerMessageCallback<mq::basicQosRequest>(std::bind(&Server::onBasicQos, this,
+                                                                               std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
+            _dispatcher.registerMessageCallback<mq::basicRejectRequest>(std::bind(&Server::onBasicReject, this,
+                                                                                  std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
             _dispatcher.registerMessageCallback<mq::basicConsumeRequest>(std::bind(&Server::onBasicConsume, this,
                                                                                    std::placeholders::_1, std::placeholders::_2, std::placeholders::_3));
             _dispatcher.registerMessageCallback<mq::basicCancelRequest>(std::bind(&Server::onBasicCancel, this,
@@ -72,6 +79,8 @@ namespace mq
         void start()
         {
             _server.start();
+            // 每秒扫描一次 wait-ack，处理 ACK 超时与死信。
+            _baseloop.runEvery(1.0, std::bind(&Server::onAckTimeout, this));
             _baseloop.loop();
         }
 
@@ -244,6 +253,42 @@ namespace mq
             }
             return cp->basicAck(message);
         }
+        // 设置消费者预取数量
+        void onBasicQos(const muduo::net::TcpConnectionPtr &conn, const basicQosRequestPtr &message, muduo::Timestamp)
+        {
+            Connection::ptr mconn = _connection_manager->getConnection(conn);
+            if (mconn.get() == nullptr)
+            {
+                DLOG("设置 QoS 时，没有找到连接对应的Connection对象！");
+                conn->shutdown();
+                return;
+            }
+            Channel::ptr cp = mconn->getChannel(message->cid());
+            if (cp.get() == nullptr)
+            {
+                DLOG("设置 QoS 时，没有找到信道！");
+                return;
+            }
+            return cp->basicQos(message);
+        }
+        // 拒绝消息
+        void onBasicReject(const muduo::net::TcpConnectionPtr &conn, const basicRejectRequestPtr &message, muduo::Timestamp)
+        {
+            Connection::ptr mconn = _connection_manager->getConnection(conn);
+            if (mconn.get() == nullptr)
+            {
+                DLOG("拒绝消息时，没有找到连接对应的Connection对象！");
+                conn->shutdown();
+                return;
+            }
+            Channel::ptr cp = mconn->getChannel(message->cid());
+            if (cp.get() == nullptr)
+            {
+                DLOG("拒绝消息时，没有找到信道！");
+                return;
+            }
+            return cp->basicReject(message);
+        }
         // 队列消息订阅
         void onBasicConsume(const muduo::net::TcpConnectionPtr &conn, const basicConsumeRequestPtr &message, muduo::Timestamp)
         {
@@ -286,11 +331,18 @@ namespace mq
             LOG_INFO << "onUnknownMessage: " << message->GetTypeName();
             conn->shutdown();
         }
+        void onAckTimeout()
+        {
+            if (_queue_dispatcher)
+            {
+                _queue_dispatcher->checkAckTimeout();
+            }
+        }
         void onConnection(const muduo::net::TcpConnectionPtr &conn)
         {
             if (conn->connected())
             {
-                _connection_manager->newConnection(_virtual_host, _consumer_manager, _codec, conn, _threadpool);
+                _connection_manager->newConnection(_virtual_host, _consumer_manager, _codec, conn, _queue_dispatcher);
             }
             else
             {
@@ -307,6 +359,7 @@ namespace mq
         ConsumerManager::ptr _consumer_manager;
         ConnectionManager::ptr _connection_manager;
         threadpool::ptr _threadpool;
+        QueueDispatcher::ptr _queue_dispatcher;
     };
 }
 #endif

@@ -21,6 +21,11 @@ class threadpool {
         ~threadpool() {
             stop();
         }
+        // 线程池是否已经停止接收新任务。
+        // Weak callers（例如队列调度器）用它避免在服务退出阶段继续投递任务。
+        bool stopped() const {
+            return _stop.load();
+        }
         void stop() {
             if (_stop == true) return;
             _stop = true;

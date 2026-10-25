@@ -71,6 +71,20 @@ message basicAckRequest {
     string queue_name = 3;
     string message_id = 4;
 };
+//消费者的预取数量（QoS）
+message basicQosRequest {
+    string rid = 1;
+    string cid = 2;
+    uint32 prefetch_count = 3;
+};
+//拒绝消息：requeue=true 重新入队，false 丢弃或进入死信队列
+message basicRejectRequest {
+    string rid = 1;
+    string cid = 2;
+    string queue_name = 3;
+    string message_id = 4;
+    bool requeue = 5;
+};
 //队列的订阅
 message basicConsumeRequest {
     string rid = 1;

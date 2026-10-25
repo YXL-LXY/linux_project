@@ -9,6 +9,6 @@ int main()
         std::make_shared<mq::ConsumerManager>(),
         mq::ProtobufCodecPtr(),
         muduo::net::TcpConnectionPtr(),
-        threadpool::ptr());
+        mq::QueueDispatcher::ptr());
     return 0;
 }

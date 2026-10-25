@@ -155,6 +155,7 @@ namespace mq
                 req.mutable_properties()->set_id(bp->id());
                 req.mutable_properties()->set_delivery_mode(bp->delivery_mode());
                 req.mutable_properties()->set_routing_key(bp->routing_key());
+                req.mutable_properties()->set_delivery_count(bp->delivery_count());
             }
             _codec->send(_conn, req);
             waitResponseOk(rid, "发布消息");
@@ -163,7 +164,12 @@ namespace mq
 
         void basicAck(const std::string &msgid)
         {
-            if (_consumer.get() == nullptr)
+            Consumer::ptr consumer;
+            {
+                std::unique_lock<std::mutex> lock(_consumer_mutex);
+                consumer = _consumer;
+            }
+            if (consumer.get() == nullptr)
             {
                 DLOG("消息确认时，找不到消费者信息！");
                 return;
@@ -172,16 +178,57 @@ namespace mq
             basicAckRequest req;
             req.set_rid(rid);
             req.set_cid(_cid);
-            req.set_queue_name(_consumer->qname);
+            req.set_queue_name(consumer->qname);
             req.set_message_id(msgid);
             _codec->send(_conn, req);
             waitResponseOk(rid, "确认消息");
             return;
         }
 
+        // 设置当前信道的 prefetch。0 表示不限制。
+        bool basicQos(uint32_t prefetch_count)
+        {
+            std::string rid = UUIDHelper::uuid();
+            basicQosRequest req;
+            req.set_rid(rid);
+            req.set_cid(_cid);
+            req.set_prefetch_count(prefetch_count);
+            _codec->send(_conn, req);
+            return waitResponseOk(rid, "设置 QoS");
+        }
+
+        // 消费失败时拒绝消息；requeue=true 会让 broker 重新投递。
+        bool basicReject(const std::string &msgid, bool requeue)
+        {
+            Consumer::ptr consumer;
+            {
+                std::unique_lock<std::mutex> lock(_consumer_mutex);
+                consumer = _consumer;
+            }
+            if (consumer.get() == nullptr)
+            {
+                DLOG("拒绝消息时，找不到消费者信息！");
+                return false;
+            }
+            std::string rid = UUIDHelper::uuid();
+            basicRejectRequest req;
+            req.set_rid(rid);
+            req.set_cid(_cid);
+            req.set_queue_name(consumer->qname);
+            req.set_message_id(msgid);
+            req.set_requeue(requeue);
+            _codec->send(_conn, req);
+            return waitResponseOk(rid, "拒绝消息");
+        }
+
         void basicCancel()
         {
-            if (_consumer.get() == nullptr)
+            Consumer::ptr consumer;
+            {
+                std::unique_lock<std::mutex> lock(_consumer_mutex);
+                consumer = _consumer;
+            }
+            if (consumer.get() == nullptr)
             {
                 return;
             }
@@ -189,11 +236,17 @@ namespace mq
             basicCancelRequest req;
             req.set_rid(rid);
             req.set_cid(_cid);
-            req.set_queue_name(_consumer->qname);
-            req.set_consumer_tag(_consumer->tag);
+            req.set_queue_name(consumer->qname);
+            req.set_consumer_tag(consumer->tag);
             _codec->send(_conn, req);
             waitResponseOk(rid, "取消订阅");
-            _consumer.reset();
+            {
+                std::unique_lock<std::mutex> lock(_consumer_mutex);
+                if (_consumer == consumer)
+                {
+                    _consumer.reset();
+                }
+            }
             return;
         }
 
@@ -203,11 +256,18 @@ namespace mq
             bool auto_ack,
             const ConsumerCallback &cb)
         {
-            if (_consumer.get() != nullptr)
             {
-                DLOG("当前信道已订阅其他队列消息！");
-                return false;
+                std::unique_lock<std::mutex> lock(_consumer_mutex);
+                if (_consumer.get() != nullptr)
+                {
+                    DLOG("当前信道已订阅其他队列消息！");
+                    return false;
+                }
+                // 必须在发送请求之前安装消费者：服务端订阅成功后会立刻开始
+                // 正常投递，网络线程可能在 waitResponseOk 返回前就收到消息。
+                _consumer = std::make_shared<Consumer>(consumer_tag, queue_name, auto_ack, cb);
             }
+
             std::string rid = UUIDHelper::uuid();
             basicConsumeRequest req;
             req.set_rid(rid);
@@ -219,9 +279,10 @@ namespace mq
             if (waitResponseOk(rid, "订阅队列") == false)
             {
                 DLOG("添加订阅失败或等待响应超时！");
+                std::unique_lock<std::mutex> lock(_consumer_mutex);
+                _consumer.reset();
                 return false;
             }
-            _consumer = std::make_shared<Consumer>(consumer_tag, queue_name, auto_ack, cb);
             return true;
         }
 
@@ -237,17 +298,22 @@ namespace mq
         // 连接收到消息推送后，需要通过信道找到对应的消费者对象，通过回调函数进行消息处理
         void consume(const basicConsumeResponsePtr &resp)
         {
-            if (_consumer.get() == nullptr)
+            Consumer::ptr consumer;
+            {
+                std::unique_lock<std::mutex> lock(_consumer_mutex);
+                consumer = _consumer;
+            }
+            if (consumer.get() == nullptr)
             {
                 DLOG("消息处理时，未找到订阅者信息！");
                 return;
             }
-            if (_consumer->tag != resp->consumer_tag())
+            if (consumer->tag != resp->consumer_tag())
             {
                 DLOG("收到的推送消息中的消费者标识，与当前信道消费者标识不一致！");
                 return;
             }
-            _consumer->callback(resp->consumer_tag(), resp->mutable_properties(), resp->body());
+            consumer->callback(resp->consumer_tag(), resp->mutable_properties(), resp->body());
         }
 
     private:
@@ -283,6 +349,7 @@ namespace mq
         muduo::net::TcpConnectionPtr _conn;
         ProtobufCodecPtr _codec;
         Consumer::ptr _consumer;
+        std::mutex _consumer_mutex;
         std::mutex _mutex;
         std::condition_variable _cv;
         std::unordered_map<std::string, basicCommonResponsePtr> _basic_resp;

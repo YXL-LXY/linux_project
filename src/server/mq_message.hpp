@@ -8,12 +8,25 @@
 #include <mutex>
 #include <memory>
 #include <list>
+#include <vector>
+#include <algorithm>
+#include <stdint.h>
+#include <chrono>
 
 namespace mq
 {
 #define DATAFILE_SUBFIX ".mqd"
 #define TMPFILE_SUBFIX ".mqd.tmp"
     using MessagePtr = std::shared_ptr<mq::Message>;
+
+    // 使用 steady_clock，避免系统时间调整影响 ACK 超时判断。
+    inline uint64_t mqNowMs()
+    {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+    }
     class MessageMapper
     {
     public:
@@ -54,24 +67,36 @@ namespace mq
         }
         bool remove(MessagePtr &msg)
         {
-            // 1. 将msg中的有效标志位修改为 '0'
-            msg->mutable_payload()->set_valid("0");
-            // 2. 对msg进行序列化
-            std::string body = msg->payload().SerializeAsString();
-            if (body.size() != msg->length())
+            // 注意：不能直接序列化内存中的 msg。投递后 delivery_count 会变化，
+            // 序列化长度可能和落盘时的长度不同。这里读取原始记录，只把 valid
+            // 从 "1" 改成 "0"，字段长度不变，才能安全地原地覆盖。
+            FileHelper helper(_datafile);
+            std::string body(msg->length(), '\0');
+            if (helper.read(&body[0], msg->offset(), msg->length()) == false)
+            {
+                DLOG("读取待确认消息的持久化数据失败！");
+                return false;
+            }
+            mq::Message::Payload payload;
+            if (payload.ParseFromString(body) == false)
+            {
+                DLOG("反序列化待确认消息的持久化数据失败！");
+                return false;
+            }
+            payload.set_valid("0");
+            std::string new_body = payload.SerializeAsString();
+            if (new_body.size() != msg->length())
             {
                 DLOG("不能修改文件中的数据信息，因为新生成的数据与原数据长度不一致!");
                 return false;
             }
-            // 3. 将序列化后的消息，写入到数据在文件中的指定位置（覆盖原有的数据）
-            FileHelper helper(_datafile);
-            bool ret = helper.write(body.c_str(), msg->offset(), body.size());
+            bool ret = helper.write(new_body.c_str(), msg->offset(), new_body.size());
             if (ret == false)
             {
                 DLOG("向队列数据文件写入数据失败！");
                 return false;
             }
-            // DLOG("确认消息后，删除持久化消息成功：%s", msg->payload().body().c_str());
+            msg->mutable_payload()->set_valid("0");
             return true;
         }
         std::list<MessagePtr> gc()
@@ -135,8 +160,14 @@ namespace mq
                     return false;
                 }
                 offset += sizeof(size_t);
+                if (msg_size > fsize - offset)
+                {
+                    DLOG("消息长度 %zu 超出数据文件剩余大小 %zu，数据文件可能损坏！",
+                         msg_size, fsize - offset);
+                    return false;
+                }
                 std::string msg_body(msg_size, '\0');
-                data_file_helper.read(&msg_body[0], offset, msg_size);
+                ret = data_file_helper.read(&msg_body[0], offset, msg_size);
                 if (ret == false)
                 {
                     DLOG("读取消息数据失败！");
@@ -144,7 +175,11 @@ namespace mq
                 }
                 offset += msg_size;
                 MessagePtr msgp = std::make_shared<Message>();
-                msgp->mutable_payload()->ParseFromString(msg_body); 
+                if (msgp->mutable_payload()->ParseFromString(msg_body) == false)
+                {
+                    DLOG("反序列化消息失败，数据文件可能损坏！");
+                    return false;
+                }
                 // DLOG("加载到有效数据：%s", msgp->payload().body().c_str());
                 // 如果是无效消息，则直接处理下一个
                 if (msgp->payload().valid() == "0")
@@ -181,7 +216,7 @@ namespace mq
                 return false;
             }
             // 4. 更新msg中的实际存储信息
-            msg->set_offset(fsize + sizeof(size_t)); 
+            msg->set_offset(fsize + sizeof(size_t));
             msg->set_length(body.size());
             return true;
         }
@@ -194,13 +229,69 @@ namespace mq
 
     class QueueMessage
     {
+        // wait-ack 里除了消息本身，还要记住是哪个消费者取走的。
+        // 消费者断线时，只能把它自己的消息重新入队，不能影响其他消费者。
+        struct WaitAckEntry
+        {
+            WaitAckEntry(const MessagePtr &m, const std::string &tag, uint64_t seq,
+                         uint64_t deadline)
+                : msg(m), consumer_tag(tag), sequence(seq), deadline_ms(deadline) {}
+            MessagePtr msg;
+            std::string consumer_tag;
+            uint64_t sequence;    // 保持重新入队时的原始投递顺序
+            uint64_t deadline_ms; // 0 表示不启用 ACK 超时
+        };
+
     public:
         using ptr = std::shared_ptr<QueueMessage>;
-        QueueMessage(std::string &basedir, const std::string &qname) : _mapper(basedir, qname),
-                                                                       _qname(qname), _valid_count(0), _total_count(0) {}
+
+        // 拒绝/超时处理结果：found 表示消息确实在 wait-ack 中；
+        // dead_letter 非空表示这条消息不应重新入队，而应交给死信交换机。
+        struct RejectResult
+        {
+            RejectResult() : found(false), dead_letter(false) {}
+            bool found;
+            std::string consumer_tag;
+            MessagePtr msg;
+            bool dead_letter;
+        };
+        // 超时扫描时，一条 wait-ack 消息的处理结果。
+        struct ExpiredEntry
+        {
+            ExpiredEntry(const std::string &tag, const MessagePtr &m, bool dead)
+                : consumer_tag(tag), msg(m), dead_letter(dead) {}
+            std::string consumer_tag;
+            MessagePtr msg;
+            bool dead_letter;
+        };
+
+        QueueMessage(std::string &basedir, const std::string &qname, size_t max_size = 0)
+            : _qname(qname),
+              _valid_count(0),
+              _total_count(0),
+              _max_size(max_size),
+              _mapper(basedir, qname),
+              _waitack_seq(0) {}
+
+        // 声明队列时支持动态修改 x-max-length。
+        // 调小上限时会立刻淘汰旧消息。
+        void set_max_size(size_t v)
+        {
+            std::unique_lock<std::mutex> lock(_mutex);
+            if (_max_size == v)
+            {
+                return;
+            }
+            _max_size = v;
+            trim_locked();
+        }
+        size_t get_max_size()
+        {
+            std::unique_lock<std::mutex> lock(_mutex);
+            return _max_size;
+        }
         bool recovery()
         {
-            // 恢复历史消息
             std::unique_lock<std::mutex> lock(_mutex);
             _msgs = _mapper.gc();
             for (auto &msg : _msgs)
@@ -208,8 +299,12 @@ namespace mq
                 _durable_msgs.insert(std::make_pair(msg->payload().properties().id(), msg));
             }
             _valid_count = _total_count = _msgs.size();
+
+            // 恢复后如果就绪消息超过上限，保留最新消息，丢弃最旧的。
+            trim_locked();
             return true;
         }
+
         bool insert(const BasicProperties *bp, const std::string &body, bool queue_is_durable)
         {
             // 1. 构造消息对象
@@ -218,7 +313,9 @@ namespace mq
             if (bp != nullptr)
             {
                 DeliveryMode mode = queue_is_durable ? bp->delivery_mode() : DeliveryMode::UNDURABLE;
-                msg->mutable_payload()->mutable_properties()->set_id(bp->id());
+                // 消息 id 是 wait-ack / 持久化索引的 key，不能为空，否则多条消息会互相覆盖
+                std::string msg_id = bp->id().empty() ? UUIDHelper::uuid() : bp->id();
+                msg->mutable_payload()->mutable_properties()->set_id(msg_id);
                 msg->mutable_payload()->mutable_properties()->set_delivery_mode(mode);
                 msg->mutable_payload()->mutable_properties()->set_routing_key(bp->routing_key());
             }
@@ -229,6 +326,9 @@ namespace mq
                 msg->mutable_payload()->mutable_properties()->set_delivery_mode(mode);
                 msg->mutable_payload()->mutable_properties()->set_routing_key("");
             }
+            // 新消息总是从 0 开始计数；重投次数由 broker 在每次投递时维护，
+            // 不允许发布端伪造。
+            msg->mutable_payload()->mutable_properties()->set_delivery_count(0);
             std::unique_lock<std::mutex> lock(_mutex);
             // 2. 判断消息是否需要持久化
             if (msg->payload().properties().delivery_mode() == DeliveryMode::DURABLE)
@@ -245,11 +345,14 @@ namespace mq
                 _total_count += 1;
                 _durable_msgs.insert(std::make_pair(msg->payload().properties().id(), msg));
             }
-            // 4. 内存的管理
+            // 4. 内存的管理：先入队，再按 x-max-length 淘汰最旧消息
             _msgs.push_back(msg);
+            trim_locked();
             return true;
         }
-        MessagePtr front()
+        // consumer_tag 用来记录 wait-ack 消息的归属，断线重入队时使用。
+        // ack_timeout_ms=0 表示这条消息不启用 ACK 超时。
+        MessagePtr front(const std::string &consumer_tag = "", uint64_t ack_timeout_ms = 0)
         {
             std::unique_lock<std::mutex> lock(_mutex);
             if (_msgs.size() == 0)
@@ -259,12 +362,23 @@ namespace mq
             // 获取一条队首消息：从_msgs中取出数据
             MessagePtr msg = _msgs.front();
             _msgs.pop_front();
+            // 每次投递都累加 delivery_count，重投后仍保留在原消息里。
+            BasicProperties *props = msg->mutable_payload()->mutable_properties();
+            props->set_delivery_count(props->delivery_count() + 1);
+            uint64_t deadline = 0;
+            if (ack_timeout_ms > 0)
+            {
+                deadline = mqNowMs() + ack_timeout_ms;
+            }
             // 将该消息对象，向待确认的hash表中添加一份，等到收到消息确认后进行删除
-            _waitack_msgs.insert(std::make_pair(msg->payload().properties().id(), msg));
+            _waitack_msgs.insert(std::make_pair(
+                msg->payload().properties().id(),
+                WaitAckEntry(msg, consumer_tag, _waitack_seq++, deadline)));
             return msg;
         }
-        // 每次删除消息后，判断是否需要垃圾回收
-        bool remove(const std::string &msg_id)
+        // 确认消息。返回消息原来的 owner（consumer_tag），供上层减少在途计数；
+        // 找不到消息或没有 owner 时返回空字符串。
+        std::string remove(const std::string &msg_id)
         {
             std::unique_lock<std::mutex> lock(_mutex);
             // 1. 从待确认队列中查找消息
@@ -272,21 +386,135 @@ namespace mq
             if (it == _waitack_msgs.end())
             {
                 DLOG("没有找到要删除的消息：%s!", msg_id.c_str());
-                return true;
+                return std::string();
             }
+            MessagePtr msg = it->second.msg;
+            std::string consumer_tag = it->second.consumer_tag;
             // 2. 根据消息的持久化模式，决定是否删除持久化信息
-            if (it->second->payload().properties().delivery_mode() == DeliveryMode::DURABLE)
-            {
-                // 3. 删除持久化信息
-                _mapper.remove(it->second);
-                _durable_msgs.erase(msg_id);
-                _valid_count -= 1; // 持久化文件中有效消息数量 -1
-                gc();              // 内部判断是否需要垃圾回收，需要的话则回收一下
-            }
-            // 4. 删除内存中的信息
+            discard_locked(msg);
+            // 3. 删除内存中的信息
             _waitack_msgs.erase(msg_id);
-            // DLOG("确认消息后，删除消息的管理成功：%s", it->second->payload().body().c_str());
-            return true;
+            // DLOG("确认消息后，删除消息的管理成功：%s", msg->payload().body().c_str());
+            return consumer_tag;
+        }
+
+        // 拒绝一条 wait-ack 消息。
+        // requeue=true 且未超过最大投递次数时放回队首；
+        // requeue=false 或超过最大投递次数时标记为 dead_letter，
+        // 由 VirtualHost 决定路由到死信交换机还是直接丢弃。
+        RejectResult reject(const std::string &msg_id, bool requeue,
+                            uint32_t max_delivery_count)
+        {
+            std::unique_lock<std::mutex> lock(_mutex);
+            RejectResult result;
+            auto it = _waitack_msgs.find(msg_id);
+            if (it == _waitack_msgs.end())
+            {
+                return result;
+            }
+            result.found = true;
+            result.consumer_tag = it->second.consumer_tag;
+            result.msg = it->second.msg;
+            _waitack_msgs.erase(it);
+
+            if (requeue)
+            {
+                uint32_t delivery_count =
+                    result.msg->payload().properties().delivery_count();
+                if (max_delivery_count == 0 || delivery_count < max_delivery_count)
+                {
+                    _msgs.push_front(result.msg);
+                    trim_locked();
+                    return result;
+                }
+            }
+
+            // 不再重投：持久化消息要从原队列中标记为无效。
+            result.dead_letter = true;
+            discard_locked(result.msg);
+            return result;
+        }
+
+        // 扫描已超时的 wait-ack 消息。返回处理的条目；其中 dead_letter=true
+        // 的消息已经不会再回到本队列，需要交给死信交换机。
+        size_t requeueExpired(uint64_t now_ms, uint32_t max_delivery_count,
+                              std::vector<ExpiredEntry> &expired)
+        {
+            std::unique_lock<std::mutex> lock(_mutex);
+            std::vector<WaitAckEntry> candidates;
+            for (auto it = _waitack_msgs.begin(); it != _waitack_msgs.end();)
+            {
+                if (it->second.deadline_ms != 0 && it->second.deadline_ms <= now_ms)
+                {
+                    candidates.push_back(it->second);
+                    it = _waitack_msgs.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+            if (candidates.empty())
+            {
+                return 0;
+            }
+
+            // 与断线重入队一致，按原投递顺序放回队首。
+            std::sort(candidates.begin(), candidates.end(),
+                      [](const WaitAckEntry &a, const WaitAckEntry &b) {
+                          return a.sequence < b.sequence;
+                      });
+            for (auto it = candidates.rbegin(); it != candidates.rend(); ++it)
+            {
+                uint32_t delivery_count =
+                    it->msg->payload().properties().delivery_count();
+                bool dead = (max_delivery_count != 0 &&
+                             delivery_count >= max_delivery_count);
+                if (dead)
+                {
+                    discard_locked(it->msg);
+                }
+                else
+                {
+                    _msgs.push_front(it->msg);
+                }
+                expired.push_back(ExpiredEntry(it->consumer_tag, it->msg, dead));
+            }
+            trim_locked();
+            return candidates.size();
+        }
+
+        // 消费者断线/取消订阅时，把它取走但尚未 ACK 的消息放回队首。
+        // 返回值是重新入队的消息数量。
+        size_t requeueByConsumer(const std::string &consumer_tag)
+        {
+            std::unique_lock<std::mutex> lock(_mutex);
+            std::vector<WaitAckEntry> requeued;
+            for (auto it = _waitack_msgs.begin(); it != _waitack_msgs.end();)
+            {
+                if (it->second.consumer_tag == consumer_tag)
+                {
+                    requeued.push_back(it->second);
+                    it = _waitack_msgs.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+
+            // 按原投递顺序放回队首，保证 requeue 后不会把任务顺序打乱。
+            std::sort(requeued.begin(), requeued.end(),
+                      [](const WaitAckEntry &a, const WaitAckEntry &b) {
+                          return a.sequence < b.sequence;
+                      });
+            for (auto it = requeued.rbegin(); it != requeued.rend(); ++it)
+            {
+                _msgs.push_front(it->msg);
+            }
+            // 重新入队后这些消息又变成“就绪消息”，仍要遵守 x-max-length。
+            trim_locked();
+            return requeued.size();
         }
         size_t getable_count() // 待推送消息数量
         {
@@ -315,11 +543,65 @@ namespace mq
             _msgs.clear();
             _durable_msgs.clear();
             _waitack_msgs.clear();
+            _waitack_seq = 0;
             _valid_count = 0;
             _total_count = 0;
         }
 
     private:
+        // 调用方必须持有 _mutex。
+        // 消息完成 ACK、被拒绝且不重投、或因超过最大投递次数进入死信时调用。
+        void discard_locked(MessagePtr msg)
+        {
+            if (msg->payload().properties().delivery_mode() != DeliveryMode::DURABLE)
+            {
+                return;
+            }
+            _mapper.remove(msg);
+            _durable_msgs.erase(msg->payload().properties().id());
+            if (_valid_count > 0)
+            {
+                _valid_count -= 1;
+            }
+            gc();
+        }
+
+        // 调用方必须持有 _mutex。
+        // 上限只约束“待推送”消息；已经被消费者取走但未 ack 的消息不在这里淘汰。
+        void trim_locked()
+        {
+            if (_max_size == 0)
+            {
+                return;
+            }
+
+            bool need_gc = false;
+            while (_msgs.size() > _max_size)
+            {
+                MessagePtr discard_msg = _msgs.front();
+                _msgs.pop_front();
+                DLOG("队列[%s]达到最大长度 %zu，丢弃最旧就绪消息, msg_id:%s",
+                     _qname.c_str(), _max_size, discard_msg->payload().properties().id().c_str());
+
+                // 持久化消息需要标记为无效，否则重启后会被恢复回来。
+                if (discard_msg->payload().properties().delivery_mode() == DeliveryMode::DURABLE)
+                {
+                    _mapper.remove(discard_msg);
+                    _durable_msgs.erase(discard_msg->payload().properties().id());
+                    if (_valid_count > 0)
+                    {
+                        _valid_count--;
+                    }
+                    need_gc = true;
+                }
+            }
+
+            if (need_gc)
+            {
+                gc();
+            }
+        }
+
         bool GCCheck()
         {
             // 持久化的消息总量大于2000， 且其中有效比例低于50%则需要持久化
@@ -356,12 +638,14 @@ namespace mq
     private:
         std::mutex _mutex;
         std::string _qname;
-        size_t _valid_count; //有效消息数量
-        size_t _total_count; //总的持久化消息数量
+        size_t _valid_count;                                       // 有效消息数量
+        size_t _total_count;                                       // 总的持久化消息数量
+        size_t _max_size;                                          // 0 = 无上限
         MessageMapper _mapper;                                     // 持久化管理消息map
         std::list<MessagePtr> _msgs;                               // 待推送消息
         std::unordered_map<std::string, MessagePtr> _durable_msgs; // 持久化消息hash
-        std::unordered_map<std::string, MessagePtr> _waitack_msgs; // 待确认消息hash
+        std::unordered_map<std::string, WaitAckEntry> _waitack_msgs; // 待确认消息hash
+        uint64_t _waitack_seq;                                     // wait-ack 投递序号
     };
 
     class MessageManager
@@ -377,21 +661,40 @@ namespace mq
                 qmsg.second->clear();
             }
         }
-        void initQueueMessage(const std::string &qname)
+        void initQueueMessage(const std::string &qname, size_t max_size = 0, bool apply_max_size = false)
         {
             QueueMessage::ptr qmp;
+            bool created = false;
             {
                 std::unique_lock<std::mutex> lock(_mutex);
                 auto it = _queue_msgs.find(qname);
                 if (it != _queue_msgs.end())
                 {
-                    return;
+                    qmp = it->second;
                 }
-                qmp = std::make_shared<QueueMessage>(_basedir, qname);
-                _queue_msgs.insert(std::make_pair(qname, qmp));
+                else
+                {
+                    qmp = std::make_shared<QueueMessage>(_basedir, qname,
+                                                         apply_max_size ? max_size : 0);
+                    _queue_msgs.insert(std::make_pair(qname, qmp));
+                    created = true;
+                }
             }
-            qmp->recovery();
+
+            if (created)
+            {
+                qmp->recovery();
+                return;
+            }
+
+            // 队列已存在：只有本次声明显式带了 x-max-length 才更新，
+            // 避免其他客户端用空 args 重复声明时把已有上限清掉。
+            if (apply_max_size)
+            {
+                qmp->set_max_size(max_size);
+            }
         }
+
         void destroyQueueMessage(const std::string &qname)
         {
             QueueMessage::ptr qmp;
@@ -422,7 +725,8 @@ namespace mq
             }
             return qmp->insert(bp, body, queue_is_durable);
         }
-        MessagePtr front(const std::string &qname)
+        MessagePtr front(const std::string &qname, const std::string &consumer_tag = "",
+                         uint64_t ack_timeout_ms = 0)
         {
             QueueMessage::ptr qmp;
             {
@@ -435,9 +739,25 @@ namespace mq
                 }
                 qmp = it->second;
             }
-            return qmp->front();
+            return qmp->front(consumer_tag, ack_timeout_ms);
         }
-        void ack(const std::string &qname, const std::string &msg_id)
+        // 某个消费者断线后，把它未确认的消息重新放回队列。
+        size_t requeueByConsumer(const std::string &qname, const std::string &consumer_tag)
+        {
+            QueueMessage::ptr qmp;
+            {
+                std::unique_lock<std::mutex> lock(_mutex);
+                auto it = _queue_msgs.find(qname);
+                if (it == _queue_msgs.end())
+                {
+                    DLOG("重新入队队列%s的消息失败：没有找到消息管理句柄!", qname.c_str());
+                    return 0;
+                }
+                qmp = it->second;
+            }
+            return qmp->requeueByConsumer(consumer_tag);
+        }
+        std::string ack(const std::string &qname, const std::string &msg_id)
         {
             QueueMessage::ptr qmp;
             {
@@ -446,12 +766,45 @@ namespace mq
                 if (it == _queue_msgs.end())
                 {
                     DLOG("确认队列%s消息%s失败：没有找到消息管理句柄!", qname.c_str(), msg_id.c_str());
-                    return;
+                    return std::string();
                 }
                 qmp = it->second;
             }
-            qmp->remove(msg_id);
-            return;
+            return qmp->remove(msg_id);
+        }
+        QueueMessage::RejectResult reject(const std::string &qname,
+                                          const std::string &msg_id,
+                                          bool requeue,
+                                          uint32_t max_delivery_count)
+        {
+            QueueMessage::ptr qmp;
+            {
+                std::unique_lock<std::mutex> lock(_mutex);
+                auto it = _queue_msgs.find(qname);
+                if (it == _queue_msgs.end())
+                {
+                    DLOG("拒绝队列%s消息%s失败：没有找到消息管理句柄!", qname.c_str(), msg_id.c_str());
+                    return QueueMessage::RejectResult();
+                }
+                qmp = it->second;
+            }
+            return qmp->reject(msg_id, requeue, max_delivery_count);
+        }
+        size_t requeueExpired(const std::string &qname, uint64_t now_ms,
+                              uint32_t max_delivery_count,
+                              std::vector<QueueMessage::ExpiredEntry> &expired)
+        {
+            QueueMessage::ptr qmp;
+            {
+                std::unique_lock<std::mutex> lock(_mutex);
+                auto it = _queue_msgs.find(qname);
+                if (it == _queue_msgs.end())
+                {
+                    return 0;
+                }
+                qmp = it->second;
+            }
+            return qmp->requeueExpired(now_ms, max_delivery_count, expired);
         }
         size_t getable_count(const std::string &qname)
         {

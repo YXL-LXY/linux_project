@@ -10,16 +10,16 @@ namespace mq
                    const ConsumerManager::ptr &cmp,
                    const ProtobufCodecPtr &codec,
                    const muduo::net::TcpConnectionPtr &conn,
-                   const threadpool::ptr &pool) : _conn(conn),
-                                                  _codec(codec),
-                                                  _cmp(cmp),
-                                                  _host(host),
-                                                  _pool(pool),
-                                                  _channels(std::make_shared<ChannelManager>()) {}
+                   const QueueDispatcher::ptr &qdispatcher) : _conn(conn),
+                                                              _codec(codec),
+                                                              _cmp(cmp),
+                                                              _host(host),
+                                                              _qdispatcher(qdispatcher),
+                                                              _channels(std::make_shared<ChannelManager>()) {}
         void openChannel(const openChannelRequestPtr &req)
         {
             // 1. 判断信道ID是否重复,创建信道
-            bool ret = _channels->openChannel(req->cid(), _host, _cmp, _codec, _conn, _pool);
+            bool ret = _channels->openChannel(req->cid(), _host, _cmp, _codec, _conn, _qdispatcher);
             if (ret == false)
             {
                 DLOG("创建信道的时候，信道ID重复了");
@@ -54,7 +54,7 @@ namespace mq
         ProtobufCodecPtr _codec;
         ConsumerManager::ptr _cmp;
         VirtualHost::ptr _host;
-        threadpool::ptr _pool;
+        QueueDispatcher::ptr _qdispatcher;
         ChannelManager::ptr _channels;
     };
 
@@ -67,7 +67,7 @@ namespace mq
                            const ConsumerManager::ptr &cmp,
                            const ProtobufCodecPtr &codec,
                            const muduo::net::TcpConnectionPtr &conn,
-                           const threadpool::ptr &pool)
+                           const QueueDispatcher::ptr &qdispatcher)
         {
             std::unique_lock<std::mutex> lock(_mutex);
             auto it = _conns.find(conn);
@@ -75,7 +75,7 @@ namespace mq
             {
                 return;
             }
-            Connection::ptr self_conn = std::make_shared<Connection>(host, cmp, codec, conn, pool);
+            Connection::ptr self_conn = std::make_shared<Connection>(host, cmp, codec, conn, qdispatcher);
             _conns.insert(std::make_pair(conn, self_conn));
         }
         void delConnection(const muduo::net::TcpConnectionPtr &conn)

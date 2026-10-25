@@ -100,6 +100,7 @@ if(MQ_BUILD_TESTS)
         mq_channeltest
         mq_connectiontest
         mq_consumertest
+        mq_dispatchertest
         mq_exchangetest
         mq_filetest
         mq_hosttest

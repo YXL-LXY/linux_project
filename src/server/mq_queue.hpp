@@ -7,6 +7,8 @@
 #include <unordered_map>
 #include <mutex>
 #include <memory>
+#include <cstdlib>
+#include <cerrno>
 
 namespace mq
 {
@@ -37,6 +39,10 @@ namespace mq
             for (auto &str : sub_args)
             {
                 size_t pos = str.find("=");
+                if (pos == std::string::npos)
+                {
+                    continue;
+                }
                 std::string key = str.substr(0, pos);
                 std::string val = str.substr(pos + 1);
                 args[key] = val;
@@ -52,6 +58,124 @@ namespace mq
             return result;
         }
     };
+
+    // 解析队列参数中的 x-max-length。
+    // 返回 true 表示参数存在且合法，max_length 为有效值；
+    // 返回 false 表示未设置或值非法，调用方应保持原有/默认的无上限行为。
+    inline bool parseQueueMaxLength(const google::protobuf::Map<std::string, std::string> &args,
+                                    size_t &max_length)
+    {
+        auto it = args.find("x-max-length");
+        if (it == args.end())
+        {
+            return false;
+        }
+        const std::string &text = it->second;
+        if (text.empty())
+        {
+            DLOG("队列参数 x-max-length 为空，按无上限处理");
+            return false;
+        }
+
+        errno = 0;
+        char *end = nullptr;
+        const char *begin = text.c_str();
+        while (*begin == ' ' || *begin == '\t')
+        {
+            ++begin;
+        }
+        // strtoull 会接受 "-1" 并回绕成很大的正数，这里显式拒绝负号。
+        if (*begin == '-')
+        {
+            DLOG("队列参数 x-max-length=%s 非法，按无上限处理", text.c_str());
+            return false;
+        }
+        unsigned long long value = std::strtoull(text.c_str(), &end, 10);
+        if (errno != 0 || end == text.c_str() || *end != '\0' || value == 0)
+        {
+            DLOG("队列参数 x-max-length=%s 非法或为 0，按无上限处理", text.c_str());
+            return false;
+        }
+        max_length = static_cast<size_t>(value);
+        return true;
+    }
+
+    // 未显式配置时，服务端每秒扫描一次 wait-ack，超过该时间仍未确认就重新入队。
+    const uint64_t MQ_DEFAULT_ACK_TIMEOUT_MS = 30000;
+
+    // 读取无符号整数队列参数。allow_zero=false 时 0 也视为非法。
+    inline bool parseQueueUnsignedArg(const google::protobuf::Map<std::string, std::string> &args,
+                                      const std::string &key,
+                                      uint64_t &value,
+                                      bool allow_zero)
+    {
+        auto it = args.find(key);
+        if (it == args.end())
+        {
+            return false;
+        }
+        const std::string &text = it->second;
+        if (text.empty())
+        {
+            DLOG("队列参数 %s 为空，按未设置处理", key.c_str());
+            return false;
+        }
+
+        const char *begin = text.c_str();
+        while (*begin == ' ' || *begin == '\t')
+        {
+            ++begin;
+        }
+        // 显式拒绝负号，避免 strtoull 回绕成很大的正数。
+        if (*begin == '-')
+        {
+            DLOG("队列参数 %s=%s 非法，按未设置处理", key.c_str(), text.c_str());
+            return false;
+        }
+
+        errno = 0;
+        char *end = nullptr;
+        unsigned long long parsed = std::strtoull(text.c_str(), &end, 10);
+        if (errno != 0 || end == text.c_str() || *end != '\0' ||
+            (!allow_zero && parsed == 0))
+        {
+            DLOG("队列参数 %s=%s 非法，按未设置处理", key.c_str(), text.c_str());
+            return false;
+        }
+        value = static_cast<uint64_t>(parsed);
+        return true;
+    }
+
+    // x-ack-timeout-ms：0 表示关闭 ACK 超时；未设置时调用方使用默认值。
+    inline bool parseQueueAckTimeout(const google::protobuf::Map<std::string, std::string> &args,
+                                     uint64_t &timeout_ms)
+    {
+        return parseQueueUnsignedArg(args, "x-ack-timeout-ms", timeout_ms, true);
+    }
+
+    // x-max-delivery-count：消息最多投递多少次；0/未设置表示不限制。
+    inline bool parseQueueMaxDeliveryCount(const google::protobuf::Map<std::string, std::string> &args,
+                                           uint32_t &count)
+    {
+        uint64_t value = 0;
+        if (parseQueueUnsignedArg(args, "x-max-delivery-count", value, false) == false)
+        {
+            return false;
+        }
+        count = static_cast<uint32_t>(value);
+        return true;
+    }
+
+    inline std::string queueArgValue(const google::protobuf::Map<std::string, std::string> &args,
+                                     const std::string &key)
+    {
+        auto it = args.find(key);
+        if (it == args.end())
+        {
+            return std::string();
+        }
+        return it->second;
+    }
 
     using QueueMap = std::unordered_map<std::string, MsgQueue::ptr>;
     class MsgQueueMapper
@@ -100,6 +224,14 @@ namespace mq
             sql << "'" << name << "';";
             _sql_helper.exec(sql.str(), nullptr, nullptr);
         }
+        bool updateArgs(MsgQueue::ptr &queue)
+        {
+            std::stringstream sql;
+            sql << "update queue_table set args='";
+            sql << queue->getArgs();
+            sql << "' where name='" << queue->name << "';";
+            return _sql_helper.exec(sql.str(), nullptr, nullptr);
+        }
         QueueMap recovery()
         {
             QueueMap result;
@@ -145,6 +277,52 @@ namespace mq
             auto it = _msg_queues.find(qname);
             if (it != _msg_queues.end())
             {
+                // 已存在的队列只更新本次声明显式携带的合法参数，
+                // 避免空 args 的重复声明把已有上限/超时/死信配置清掉。
+                bool changed = false;
+                auto set_arg = [&](const std::string &key, const std::string &value) {
+                    auto old = it->second->args.find(key);
+                    if (old == it->second->args.end() || old->second != value)
+                    {
+                        it->second->args[key] = value;
+                        changed = true;
+                    }
+                };
+
+                size_t max_length = 0;
+                if (parseQueueMaxLength(qargs, max_length))
+                {
+                    set_arg("x-max-length", std::to_string(max_length));
+                }
+
+                uint64_t ack_timeout_ms = 0;
+                if (parseQueueAckTimeout(qargs, ack_timeout_ms))
+                {
+                    set_arg("x-ack-timeout-ms", std::to_string(ack_timeout_ms));
+                }
+
+                uint32_t max_delivery_count = 0;
+                if (parseQueueMaxDeliveryCount(qargs, max_delivery_count))
+                {
+                    set_arg("x-max-delivery-count", std::to_string(max_delivery_count));
+                }
+
+                // 死信交换机/路由键是字符串参数，显式传入空值可以关闭死信。
+                auto dlx = qargs.find("x-dead-letter-exchange");
+                if (dlx != qargs.end())
+                {
+                    set_arg("x-dead-letter-exchange", dlx->second);
+                }
+                auto dlrk = qargs.find("x-dead-letter-routing-key");
+                if (dlrk != qargs.end())
+                {
+                    set_arg("x-dead-letter-routing-key", dlrk->second);
+                }
+
+                if (changed && it->second->durable == true)
+                {
+                    _mapper.updateArgs(it->second);
+                }
                 return true;
             }
             MsgQueue::ptr mqp = std::make_shared<MsgQueue>();

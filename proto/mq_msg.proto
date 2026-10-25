@@ -18,6 +18,7 @@ message BasicProperties{
     string id = 1;
     DeliveryMode delivery_mode = 2;//持久化模式 1-非持久化； 2-持久化
     string routing_key = 3;
+    uint32 delivery_count = 4;//该消息被投递的次数，用于失败重投/死信判断
 };
 
 message Message {

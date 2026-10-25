@@ -7,12 +7,11 @@
 #include "common/mq_helper.hpp"
 #include "mq_msg.pb.h"
 #include "mq_proto.pb.h"
-#include "common/mq_threadpool.hpp"
 #include "mq_consumer.hpp"
+#include "mq_dispatcher.hpp"
 #include "mq_host.hpp"
 #include "mq_route.hpp"
 #include <memory>
-#include <utility>
 
 namespace mq
 {
@@ -27,6 +26,8 @@ namespace mq
     using queueUnBindRequestPtr = std::shared_ptr<queueUnBindRequest>;
     using basicPublishRequestPtr = std::shared_ptr<basicPublishRequest>;
     using basicAckRequestPtr = std::shared_ptr<basicAckRequest>;
+    using basicQosRequestPtr = std::shared_ptr<basicQosRequest>;
+    using basicRejectRequestPtr = std::shared_ptr<basicRejectRequest>;
     using basicConsumeRequestPtr = std::shared_ptr<basicConsumeRequest>;
     using basicCancelRequestPtr = std::shared_ptr<basicCancelRequest>;
 
@@ -39,12 +40,13 @@ namespace mq
                 const ConsumerManager::ptr &cmp,
                 const ProtobufCodecPtr &codec,
                 const muduo::net::TcpConnectionPtr &conn,
-                const threadpool::ptr &pool) : _cid(id),
-                                               _conn(conn),
-                                               _codec(codec),
-                                               _cmp(cmp),
-                                               _host(host),
-                                               _pool(pool)
+                const QueueDispatcher::ptr &qdispatcher) : _cid(id),
+                                                           _conn(conn),
+                                                           _codec(codec),
+                                                           _cmp(cmp),
+                                                           _host(host),
+                                                           _qdispatcher(qdispatcher),
+                                                           _prefetch_count(0)
         {
             DLOG("new Channel: %p", this);
         }
@@ -52,7 +54,16 @@ namespace mq
         {
             if (_consumer.get() != nullptr)
             {
-                _cmp->remove(_consumer->tag, _consumer->qname);
+                // 连接/信道断开时，消费者已经取走但未 ACK 的消息必须还回队列，
+                // 否则这些消息会永远留在 wait-ack 里。
+                std::string qname = _consumer->qname;
+                std::string tag = _consumer->tag;
+                _cmp->remove(tag, qname);
+                _host->requeueByConsumer(qname, tag);
+                if (_qdispatcher)
+                {
+                    _qdispatcher->notify(qname);
+                }
             }
             DLOG("del Channel: %p", this);
         }
@@ -119,37 +130,78 @@ namespace mq
                 routing_key = properties->routing_key();
             }
 
-            // 获取当前对象弱引用，用于线程池任务
-            std::weak_ptr<Channel> weak_self = shared_from_this();
-
+            bool ok = true;
             for (auto &binding : mqbm)
             {
                 if (Router::route(ep->type, routing_key, binding.second->binding_key))
                 {
                     // 3. 将消息添加到队列中（添加消息的管理）
-                    _host->basicPublish(binding.first, properties, req->body());
-
-                    // 4. 线程池任务：使用weak_ptr避免悬空this
-                    // 注意：这里显式声明 qname 再按值捕获，保持 C++11 兼容。
-                    std::string qname = binding.first;
-                    auto task = [weak_self, qname]()
+                    if (_host->basicPublish(binding.first, properties, req->body()) == false)
                     {
-                        auto sp = weak_self.lock();
-                        if (!sp)
-                            return; // channel已经销毁，放弃消费推送任务
-                        sp->consume(qname);
-                    };
-                    _pool->push(std::move(task));
+                        ok = false;
+                        continue;
+                    }
+
+                    // 4. 通知队列调度器：队列里有新消息，可以尝试投递。
+                    // 同一个队列的多次通知会被合并，不需要为每次发布创建任务。
+                    if (_qdispatcher)
+                    {
+                        _qdispatcher->notify(binding.first);
+                    }
                 }
             }
-            return basicResponse(true, req->rid(), req->cid());
+            return basicResponse(ok, req->rid(), req->cid());
         }
 
         // 消息的确认
         void basicAck(const basicAckRequestPtr &req)
         {
-            _host->basicAck(req->queue_name(), req->message_id());
+            std::string owner = _host->basicAck(req->queue_name(), req->message_id());
+            if (!owner.empty())
+            {
+                _cmp->onAck(req->queue_name(), owner);
+            }
+            // ACK 之后消费者的在途名额被释放，可以继续投递。
+            if (_qdispatcher)
+            {
+                _qdispatcher->notify(req->queue_name());
+            }
             return basicResponse(true, req->rid(), req->cid());
+        }
+        // 设置当前信道的 prefetch。0 表示不限制。
+        void basicQos(const basicQosRequestPtr &req)
+        {
+            _prefetch_count = req->prefetch_count();
+            if (_consumer)
+            {
+                _cmp->setPrefetch(_consumer->qname, _consumer->tag,
+                                  _prefetch_count);
+                if (_qdispatcher)
+                {
+                    _qdispatcher->notify(_consumer->qname);
+                }
+            }
+            return basicResponse(true, req->rid(), req->cid());
+        }
+        // 消费失败时拒绝消息：requeue=true 重投，false 丢弃/死信。
+        void basicReject(const basicRejectRequestPtr &req)
+        {
+            VirtualHost::RejectResult result =
+                _host->basicReject(req->queue_name(), req->message_id(),
+                                   req->requeue());
+            if (result.found && !result.consumer_tag.empty())
+            {
+                _cmp->onAck(req->queue_name(), result.consumer_tag);
+            }
+            if (_qdispatcher)
+            {
+                _qdispatcher->notify(req->queue_name());
+                for (auto &target : result.notify_queues)
+                {
+                    _qdispatcher->notify(target);
+                }
+            }
+            return basicResponse(result.found, req->rid(), req->cid());
         }
         // 订阅队列消息
         void basicConsume(const basicConsumeRequestPtr &req)
@@ -158,6 +210,13 @@ namespace mq
             bool ret = _host->existsQueue(req->queue_name());
             if (ret == false)
             {
+                return basicResponse(false, req->rid(), req->cid());
+            }
+            // 一个信道只允许一个消费者，否则旧消费者会残留在 ConsumerManager 中
+            if (_consumer)
+            {
+                DLOG("信道 %s 已经订阅了队列 %s，拒绝重复订阅",
+                     _cid.c_str(), _consumer->qname.c_str());
                 return basicResponse(false, req->rid(), req->cid());
             }
             // 2. 创建队列的消费者。
@@ -171,14 +230,49 @@ namespace mq
                     return;
                 sp->callback(tag, bp, body);
             };
-            // 创建了消费者之后，当前的channel角色就是个消费者
-            _consumer = _cmp->create(req->consumer_tag(), req->queue_name(), req->auto_ack(), cb);
-            return basicResponse(true, req->rid(), req->cid());
+            // 创建了消费者之后，当前的channel角色就是个消费者；
+            // 把当前信道通过 basicQos 设置的上限带给消费者。
+            _consumer = _cmp->create(req->consumer_tag(), req->queue_name(),
+                                     req->auto_ack(), cb, _prefetch_count);
+            // create 可能因为消费者 tag 重复而失败
+            if (!_consumer)
+            {
+                DLOG("创建消费者失败，队列 %s 消费者 tag %s 重复",
+                     req->queue_name().c_str(), req->consumer_tag().c_str());
+                return basicResponse(false, req->rid(), req->cid());
+            }
+
+            // 先回复订阅成功，再让调度器按正常队列语义投递。
+            // 新消费者不会“独占”历史消息，而是和其他消费者一起竞争队列里的消息。
+            basicResponse(true, req->rid(), req->cid());
+            if (_qdispatcher)
+            {
+                _qdispatcher->notify(req->queue_name());
+            }
         }
         // 取消订阅
         void basicCancel(const basicCancelRequestPtr &req)
         {
-            _cmp->remove(req->consumer_tag(), req->queue_name());
+            // 只允许取消当前信道自己的消费者，避免误删其他连接的订阅。
+            if (!_consumer ||
+                _consumer->tag != req->consumer_tag() ||
+                _consumer->qname != req->queue_name())
+            {
+                DLOG("取消订阅失败：信道 %s 没有消费者 %s",
+                     _cid.c_str(), req->consumer_tag().c_str());
+                return basicResponse(false, req->rid(), req->cid());
+            }
+
+            std::string qname = _consumer->qname;
+            std::string tag = _consumer->tag;
+            _cmp->remove(tag, qname);
+            // 把这个消费者未 ACK 的消息放回队首，再唤醒队列。
+            _host->requeueByConsumer(qname, tag);
+            _consumer.reset();
+            if (_qdispatcher)
+            {
+                _qdispatcher->notify(qname);
+            }
             return basicResponse(true, req->rid(), req->cid());
         }
 
@@ -195,6 +289,7 @@ namespace mq
                 resp.mutable_properties()->set_id(bp->id());
                 resp.mutable_properties()->set_delivery_mode(bp->delivery_mode());
                 resp.mutable_properties()->set_routing_key(bp->routing_key());
+                resp.mutable_properties()->set_delivery_count(bp->delivery_count());
             }
             _codec->send(_conn, resp);
         }
@@ -206,31 +301,6 @@ namespace mq
             resp.set_ok(ok);
             _codec->send(_conn, resp);
         }
-        void consume(const std::string &qname)
-        {
-            // 指定队列消费消息
-            // 1. 先从队列订阅者中取出一个订阅者
-            Consumer::ptr cp = _cmp->choose(qname);
-            if (cp.get() == nullptr)
-            {
-                DLOG("执行消费任务失败，%s 队列没有消费者！", qname.c_str());
-                return;
-            }
-            // 2. 从队列中取出一条消息
-            MessagePtr mp = _host->basicConsume(qname);
-            if (mp.get() == nullptr)
-            {
-                DLOG("执行消费任务失败，%s 队列没有消息！", qname.c_str());
-                return;
-            }
-
-            // 3. 调用订阅者对应的消息处理函数，实现消息的推送
-            cp->callback(cp->tag, mp->mutable_payload()->mutable_properties(), mp->payload().body());
-            // 4. 判断如果订阅者是自动确认---不需要等待确认，直接删除消息，否则需要外部收到消息确认后再删除
-            if (cp->auto_ack)
-                _host->basicAck(qname, mp->payload().properties().id());
-        }
-
     private:
         std::string _cid;
         Consumer::ptr _consumer;
@@ -238,7 +308,8 @@ namespace mq
         ProtobufCodecPtr _codec;
         ConsumerManager::ptr _cmp;
         VirtualHost::ptr _host;
-        threadpool::ptr _pool;
+        QueueDispatcher::ptr _qdispatcher;
+        uint32_t _prefetch_count;
     };
 
     class ChannelManager
@@ -251,7 +322,7 @@ namespace mq
                          const ConsumerManager::ptr &cmp,
                          const ProtobufCodecPtr &codec,
                          const muduo::net::TcpConnectionPtr &conn,
-                         const threadpool::ptr &pool)
+                         const QueueDispatcher::ptr &qdispatcher)
         {
             std::unique_lock<std::mutex> lock(_mutex);
             auto it = _channels.find(id);
@@ -260,7 +331,7 @@ namespace mq
                 DLOG("信道：%s 已经存在!", id.c_str());
                 return false;
             }
-            auto channel = std::make_shared<Channel>(id, host, cmp, codec, conn, pool);
+            auto channel = std::make_shared<Channel>(id, host, cmp, codec, conn, qdispatcher);
             _channels.insert(std::make_pair(id, channel));
             return true;
         }

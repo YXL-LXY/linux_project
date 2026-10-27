@@ -1,7 +1,11 @@
 #include <gtest/gtest.h>
 #include "server/mq_host.hpp"
 
-// 单元测试
+// VirtualHost 层测试：
+// - 交换机/队列/绑定/消息基础操作；
+// - x-max-length 的入队淘汰与重启恢复；
+// - durable 消息在 delivery_count 变化后仍能正确 ACK；
+// - basicReject 重投、ACK 超时重投、达到最大投递次数后的死信路由。
 class HostTest : public testing::Test {
     public:
         void SetUp() override {

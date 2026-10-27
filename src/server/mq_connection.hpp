@@ -2,6 +2,9 @@
 
 namespace mq
 {
+    // 服务端连接对象：持有该 TCP 连接上的所有 Channel。
+    // 连接断开时 Connection 被销毁，其 ChannelManager 中的 Channel 也会
+    // 逐个析构，由 Channel 负责归还 wait-ack 消息并摘除消费者。
     class Connection
     {
     public:
@@ -58,6 +61,8 @@ namespace mq
         ChannelManager::ptr _channels;
     };
 
+    // TCP 连接 -> Connection 的映射。断连时仅从表中删除，最后一个
+    // shared_ptr 释放后触发 Connection/Channel 的析构清理。
     class ConnectionManager
     {
     public:

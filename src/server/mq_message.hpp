@@ -19,6 +19,14 @@ namespace mq
 #define TMPFILE_SUBFIX ".mqd.tmp"
     using MessagePtr = std::shared_ptr<mq::Message>;
 
+    // 消息管理分为三层：
+    // - MessageMapper：单个队列的 .mqd 文件读写、垃圾回收；
+    // - QueueMessage：单个队列的内存状态（就绪 / wait-ack / 持久化索引）；
+    // - MessageManager：按队列名找到 QueueMessage，并转发操作。
+    //
+    // 只有“队列 durable 且消息 delivery_mode=DURABLE”的消息才会落盘。
+    // 非持久化消息只存在于 _msgs/_waitack_msgs 中，broker 重启后丢失。
+
     // 使用 steady_clock，避免系统时间调整影响 ACK 超时判断。
     inline uint64_t mqNowMs()
     {
@@ -27,6 +35,15 @@ namespace mq
                 std::chrono::steady_clock::now().time_since_epoch())
                 .count());
     }
+
+    // 队列数据文件的读写封装。
+    //
+    // 文件格式（追加写）：
+    //   [size_t 长度][protobuf Message::Payload 字节] [size_t 长度][...]
+    //
+    // ACK/丢弃时不删除中间的字节，而是把 Payload.valid 从 "1" 改成 "0"；
+    // 因为 protobuf 的字段长度不变，可以原地覆盖，避免移动后续数据。
+    // 当无效记录占比过高时，gc() 会把有效记录重写到 .tmp 文件再原子替换。
     class MessageMapper
     {
     public:
@@ -227,6 +244,16 @@ namespace mq
         std::string _tmpfile;
     };
 
+    // 单个队列的内存消息状态。
+    //
+    // 三个集合分别表示：
+    // - _msgs：就绪消息，等待被 basicConsume 取走；
+    // - _waitack_msgs：已投递给消费者、尚未 ACK/Reject 的消息；
+    // - _durable_msgs：已落盘消息的 id -> Message 索引，用于更新 offset/length。
+    //
+    // 一条消息在任意时刻只应处于“就绪”或“wait-ack”之一。_mutex 保护
+    // 这三个集合以及计数；所有业务判断（ACK、Reject、超时、淘汰）都在锁内
+    // 完成，避免取消息和 ACK 并发时出现重复入队。
     class QueueMessage
     {
         // wait-ack 里除了消息本身，还要记住是哪个消费者取走的。
@@ -246,7 +273,7 @@ namespace mq
         using ptr = std::shared_ptr<QueueMessage>;
 
         // 拒绝/超时处理结果：found 表示消息确实在 wait-ack 中；
-        // dead_letter 非空表示这条消息不应重新入队，而应交给死信交换机。
+        // dead_letter=true 表示这条消息不应重新入队，而应交给死信交换机。
         struct RejectResult
         {
             RejectResult() : found(false), dead_letter(false) {}
@@ -290,6 +317,9 @@ namespace mq
             std::unique_lock<std::mutex> lock(_mutex);
             return _max_size;
         }
+        // broker 启动/队列首次创建时从 .mqd 恢复消息。
+        // 恢复出来的一律是“就绪”消息；上次进程退出时未 ACK 的消息没有
+        // wait-ack owner，会被当作普通就绪消息重新投递。
         bool recovery()
         {
             std::unique_lock<std::mutex> lock(_mutex);
@@ -305,6 +335,13 @@ namespace mq
             return true;
         }
 
+        // 发布一条消息到队列。
+        //
+        // 消息是否落盘由“队列 durable + 消息 delivery_mode”共同决定：
+        // - 队列不 durable：强制按 UNDURABLE 处理；
+        // - 队列 durable 且消息 DURABLE：先写 .mqd，再进入内存队列；
+        // - 非持久化消息只进内存。
+        // 入队后统一执行 x-max-length 淘汰，超限时丢最旧的就绪消息。
         bool insert(const BasicProperties *bp, const std::string &body, bool queue_is_durable)
         {
             // 1. 构造消息对象
@@ -376,8 +413,11 @@ namespace mq
                 WaitAckEntry(msg, consumer_tag, _waitack_seq++, deadline)));
             return msg;
         }
-        // 确认消息。返回消息原来的 owner（consumer_tag），供上层减少在途计数；
-        // 找不到消息或没有 owner 时返回空字符串。
+        // 确认消息（basicAck）。
+        //
+        // 只接受仍在 wait-ack 中的消息：从 _waitack_msgs 删除、持久化消息
+        // 标记为无效，并返回原 owner（consumer_tag）供上层减少 prefetch 计数。
+        // 找不到消息或 owner 为空时返回空字符串，调用方据此判断 ACK 是否有效。
         std::string remove(const std::string &msg_id)
         {
             std::unique_lock<std::mutex> lock(_mutex);
@@ -435,8 +475,12 @@ namespace mq
             return result;
         }
 
-        // 扫描已超时的 wait-ack 消息。返回处理的条目；其中 dead_letter=true
-        // 的消息已经不会再回到本队列，需要交给死信交换机。
+        // 扫描已超时的 wait-ack 消息。
+        //
+        // 所有 deadline_ms <= now_ms 的消息都会先移出 wait-ack：
+        // - 未达到 x-max-delivery-count：按原投递顺序放回队首；
+        // - 达到上限：标记为 dead_letter，并从持久化文件中删除。
+        // 返回处理的条目；dead_letter=true 的消息需要 VirtualHost 路由到 DLX。
         size_t requeueExpired(uint64_t now_ms, uint32_t max_delivery_count,
                               std::vector<ExpiredEntry> &expired)
         {
@@ -516,7 +560,8 @@ namespace mq
             trim_locked();
             return requeued.size();
         }
-        size_t getable_count() // 待推送消息数量
+        // 当前可投递（就绪）消息数，不包含 wait-ack 中的消息。
+        size_t getable_count()
         {
             std::unique_lock<std::mutex> lock(_mutex);
             return _msgs.size();
@@ -648,6 +693,11 @@ namespace mq
         uint64_t _waitack_seq;                                     // wait-ack 投递序号
     };
 
+    // 队列消息注册表：负责按队列名找到 QueueMessage。
+    //
+    // _mutex 只保护 _queue_msgs 这个 map。每个方法先在锁内复制一份
+    // QueueMessage::ptr，再释放锁调用队列自身的方法，避免全局锁和
+    // QueueMessage::_mutex 嵌套，也避免删除队列时阻塞所有队列的读写。
     class MessageManager
     {
     public:
@@ -661,6 +711,11 @@ namespace mq
                 qmsg.second->clear();
             }
         }
+        // 队列声明时确保 QueueMessage 存在。
+        //
+        // 首次创建会立刻 recovery() 读取历史 .mqd；对已存在的队列，只有
+        // apply_max_size=true（本次声明显式带了 x-max-length）才更新上限，
+        // 避免重复声明时用空 args 把已有配置清掉。
         void initQueueMessage(const std::string &qname, size_t max_size = 0, bool apply_max_size = false)
         {
             QueueMessage::ptr qmp;
@@ -695,6 +750,8 @@ namespace mq
             }
         }
 
+        // 删除队列：先从注册表摘除，再清理消息文件和内存状态。
+        // 先摘除可以避免新消息继续进入一个正在销毁的队列。
         void destroyQueueMessage(const std::string &qname)
         {
             QueueMessage::ptr qmp;

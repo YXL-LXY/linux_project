@@ -31,6 +31,15 @@ namespace mq
     using basicConsumeRequestPtr = std::shared_ptr<basicConsumeRequest>;
     using basicCancelRequestPtr = std::shared_ptr<basicCancelRequest>;
 
+    // 服务端信道：一个 TCP 连接可以打开多个 Channel，每个 Channel 独立维护
+    // 自己的消费者、prefetch 和 rid 响应上下文。
+    //
+    // 约束：
+    // - 一个 Channel 最多一个消费者；重复 basicConsume 会被拒绝；
+    // - 所有 handler 由 muduo IO 线程串行调用，_consumer/_prefetch_count 不需要额外加锁；
+    // - 真正投递消息的 callback 在线程池执行，因此只捕获 weak_ptr，并在
+    //   Channel 已析构时直接返回；
+    // - Channel 析构/取消订阅时，必须先摘除消费者再把它的 wait-ack 消息还回队列。
     class Channel : public std::enable_shared_from_this<Channel>
     {
     public:
@@ -153,7 +162,10 @@ namespace mq
             return basicResponse(ok, req->rid(), req->cid());
         }
 
-        // 消息的确认
+        // 消息的确认。
+        //
+        // ACK 成功时归还该消息 owner 的一个 prefetch 名额；重复 ACK 或
+        // ACK 已超时/已重投的消息只做无操作，不会报错（便于客户端重试）。
         void basicAck(const basicAckRequestPtr &req)
         {
             std::string owner = _host->basicAck(req->queue_name(), req->message_id());
@@ -169,6 +181,9 @@ namespace mq
             return basicResponse(true, req->rid(), req->cid());
         }
         // 设置当前信道的 prefetch。0 表示不限制。
+        //
+        // basicQos 可能早于 basicConsume（此时只记录 _prefetch_count，创建
+        // 消费者时带上），也可能晚于 basicConsume（此时动态更新已有消费者）。
         void basicQos(const basicQosRequestPtr &req)
         {
             _prefetch_count = req->prefetch_count();
@@ -184,6 +199,9 @@ namespace mq
             return basicResponse(true, req->rid(), req->cid());
         }
         // 消费失败时拒绝消息：requeue=true 重投，false 丢弃/死信。
+        //
+        // 无论重投还是死信，消息都会离开 wait-ack，因此要归还原消费者的
+        // prefetch 名额；如果消息进入 DLX，还要唤醒死信目标队列。
         void basicReject(const basicRejectRequestPtr &req)
         {
             VirtualHost::RejectResult result =
@@ -279,7 +297,9 @@ namespace mq
     private:
         void callback(const std::string tag, const BasicProperties *bp, const std::string &body)
         {
-            // 针对参数组织出推送消息请求，将消息推送给channel对应的客户端
+            // 该回调由 QueueDispatcher 在工作线程调用。bp 指向队列中消息的
+            // 属性，只在本次调用内有效，因此这里逐字段复制到 response。
+            // ProtobufCodec::send 内部会把发送动作投递回 IO 线程，线程安全。
             basicConsumeResponse resp;
             resp.set_cid(_cid);
             resp.set_body(body);
@@ -312,6 +332,8 @@ namespace mq
         uint32_t _prefetch_count;
     };
 
+    // 一个 Connection 下的信道表。关闭连接时整体销毁，
+    // 每个 Channel 的析构函数再负责清理它自己的消费者和 wait-ack 消息。
     class ChannelManager
     {
     public:

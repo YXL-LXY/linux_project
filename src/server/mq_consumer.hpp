@@ -14,15 +14,26 @@
 namespace mq
 {
     using ConsumerCallback = std::function<void(const std::string, const BasicProperties *bp, const std::string)>;
+
+    // 一个 Consumer 对应一个 basicConsume 订阅。
+    //
+    // tag 在“同一队列”内唯一，是 wait-ack 消息的 owner，也是断线重投时
+    // 精确筛选消息的依据；不同队列可以使用相同的 tag。
+    //
+    // 线程模型：
+    // - create/remove/choose/QoS 调整会从 IO 线程或调度线程进入；
+    // - callback 在 QueueDispatcher 的线程池中执行；
+    // - ACK/Reject 又从 IO 线程回到调度器。
+    // 因此 prefetch_count/unacked_count 必须是原子变量，不能依赖外部大锁。
     struct Consumer
     {
         using ptr = std::shared_ptr<Consumer>;
-        std::string tag;   // 消费者标识
+        std::string tag;   // 消费者标识（同一队列内唯一）
         std::string qname; // 消费者订阅的队列名称
-        bool auto_ack;     // 自动确认标志
+        bool auto_ack;     // true：回调返回后由 broker 自动 ACK
         ConsumerCallback callback;
         // prefetch_count=0 表示不限制；unacked_count 是已经投递但还没 ACK 的数量。
-        // ACK 在 IO 线程处理，投递在线程池处理，因此用原子变量避免数据竞争。
+        // 这两个值共同决定 hasCapacity()，也就是消费者还能不能再收消息。
         std::atomic<uint32_t> prefetch_count;
         std::atomic<size_t> unacked_count;
 
@@ -65,13 +76,18 @@ namespace mq
         }
     };
 
-    // 以队列为单元的消费者管理结构
+    // 以队列为单元的消费者管理结构。
+    //
+    // 每个队列维护一个消费者列表和一个轮转游标 _rr_seq。choose() 从上次
+    // 的位置继续向后找，保证有多个消费者时消息大致均匀分配。
+    // 锁只保护 _consumers 和 _rr_seq，不保护 Consumer 内部原子计数；
+    // 因此持有本锁时不会阻塞正在等待 ACK 的消费者。
     class QueueConsumer
     {
     public:
         using ptr = std::shared_ptr<QueueConsumer>;
         QueueConsumer(const std::string &qname) : _qname(qname), _rr_seq(0) {}
-        // 队列新增消费者
+        // 队列新增消费者；同队列内 tag 重复时返回空指针，由调用方判错。
         Consumer::ptr create(const std::string &ctag, const std::string &queue_name, bool ack_flag,
                              const ConsumerCallback &cb, uint32_t prefetch = 0)
         {
@@ -91,7 +107,9 @@ namespace mq
             _consumers.push_back(consumer);
             return consumer;
         }
-        // 队列移除消费者
+        // 队列移除消费者。
+        // 注意：这里只删除订阅关系，不处理该消费者的 wait-ack 消息。
+        // 重新入队由 Channel 在 remove 之前调用 requeueByConsumer() 完成。
         void remove(const std::string &ctag)
         {
             // 1. 加锁
@@ -107,7 +125,9 @@ namespace mq
             }
             return;
         }
-        // 队列获取消费者：RR轮转获取，跳过已经达到 prefetch 上限的消费者。
+        // 队列获取消费者：RR 轮转获取，跳过已经达到 prefetch 上限的消费者。
+        // 返回空指针表示“当前没有可投递对象”，可能是没有消费者，也可能是
+        // 所有消费者都在等待 ACK；QueueDispatcher 会据此结束本轮 drain。
         Consumer::ptr choose()
         {
             // 1. 加锁
@@ -195,11 +215,17 @@ namespace mq
         std::vector<Consumer::ptr> _consumers;
     };
 
+    // 全局消费者注册表：queue_name -> QueueConsumer。
+    //
+    // 锁顺序固定为 ConsumerManager::_mutex -> QueueConsumer::_mutex。
+    // 各方法先在 Manager 锁内取出 QueueConsumer 的 shared_ptr，再释放 Manager
+    // 锁并调用 QueueConsumer 的方法，因此不会长期持有全局锁，也不会反向加锁。
     class ConsumerManager
     {
     public:
         using ptr = std::shared_ptr<ConsumerManager>;
         ConsumerManager() {}
+        // 队列声明时创建它的消费者管理单元；重复调用是幂等的。
         void initQueueConsumer(const std::string &qname)
         {
             // 1. 加锁
@@ -214,11 +240,15 @@ namespace mq
             auto qconsumers = std::make_shared<QueueConsumer>(qname);
             _qconsumers.insert(std::make_pair(qname, qconsumers));
         }
+        // 队列删除时销毁它的消费者管理单元。
+        // 队列删除流程会先让 Channel 取消消费者并把 wait-ack 消息恢复/清理，
+        // 因此这里只负责移除注册表项。
         void destroyQueueConsumer(const std::string &qname)
         {
             std::unique_lock<std::mutex> lock(_mutex);
             _qconsumers.erase(qname);
         }
+        // 在指定队列上创建消费者；队列尚未初始化时返回空指针。
         Consumer::ptr create(const std::string &ctag, const std::string &queue_name, bool ack_flag,
                              const ConsumerCallback &cb, uint32_t prefetch = 0)
         {

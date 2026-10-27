@@ -9,6 +9,12 @@
 
 namespace mq
 {
+    // 一个 VirtualHost 对应 broker 中的一个逻辑消息域，对上层屏蔽
+    // Exchange/Queue/Binding/Message 四个管理器的组合细节。
+    //
+    // 它本身不持有大锁：各 Manager 各自保护自己的表，消息状态由
+    // QueueMessage 的锁保护。调用方（Channel/Dispatcher）负责在操作后
+    // 唤醒相关队列，因此 VirtualHost 的方法只返回“需要通知哪些队列”。
     class VirtualHost
     {
     public:
@@ -66,6 +72,8 @@ namespace mq
             return _emp->selectExchange(ename);
         }
 
+        // 声明队列。声明是幂等的：队列已存在时只更新参数/上限，不清空消息。
+        // 注意：exclusive/auto_delete 目前只持久化字段，尚未实现独占和自动删除。
         bool declareQueue(const std::string &qname,
                           bool qdurable,
                           bool qexclusive,
@@ -127,6 +135,9 @@ namespace mq
             return _bmp->exists(ename, qname);
         }
 
+        // 发布一条消息到指定队列。
+        // 路由到哪个队列由 Routing 层决定；这里只负责把消息写入队列，
+        // 并根据队列 durable 属性决定是否落盘。
         bool basicPublish(const std::string &qname, BasicProperties *bp, const std::string &body)
         {
             MsgQueue::ptr mqp = _mqmp->selectQueue(qname);
@@ -151,7 +162,11 @@ namespace mq
         {
             return _mmp->ack(qname, msgid);
         }
-        // 拒绝消息：requeue=true 重投，false 丢弃/死信。
+        // 拒绝消息（basicReject）。
+        //
+        // requeue=true 且未超过 x-max-delivery-count 时放回队首；否则消息
+        // 被判定为死信，按源队列的 x-dead-letter-exchange 重新发布。
+        // 返回的 notify_queues 是死信真正落到的队列，调用方需要逐一唤醒。
         RejectResult basicReject(const std::string &qname, const std::string &msgid,
                                  bool requeue)
         {
@@ -167,6 +182,10 @@ namespace mq
             return result;
         }
         // 扫描所有队列中超时的 wait-ack 消息，重新入队或转入死信。
+        //
+        // 该函数由 Server 的 ACK 超时定时器调用。它只返回需要处理的结果，
+        // 不会直接操作消费者计数或调度器；QueueDispatcher::checkAckTimeout()
+        // 会根据 consumer_tags/notify_queues 完成计数归还和唤醒。
         std::vector<TimeoutResult> requeueExpired(uint64_t now_ms)
         {
             std::vector<TimeoutResult> results;
@@ -208,6 +227,8 @@ namespace mq
         {
             return _mmp->waitack_count(qname);
         }
+        // 读取队列的 ACK 超时配置；未配置时使用默认值（30 秒）。
+        // 调用方在 basicConsume/front 时把 deadline 写入 wait-ack。
         uint64_t queueAckTimeout(const std::string &qname)
         {
             MsgQueue::ptr mqp = _mqmp->selectQueue(qname);
@@ -218,6 +239,7 @@ namespace mq
             }
             return timeout_ms;
         }
+        // 读取 x-max-delivery-count；0 表示不限制重投次数。
         uint32_t queueMaxDeliveryCount(const std::string &qname)
         {
             MsgQueue::ptr mqp = _mqmp->selectQueue(qname);
@@ -238,7 +260,10 @@ namespace mq
 
     private:
         // 按源队列的 x-dead-letter-exchange 把消息重新发布到死信交换机。
-        // 返回实际收到消息的队列名，调用方需要唤醒这些队列。
+        //
+        // 路由 key 优先用 x-dead-letter-routing-key，否则沿用原 routing_key；
+        // delivery_count 在新队列中重置为 0。返回实际收到消息的队列名，
+        // 调用方需要唤醒这些队列。找不到 DLX/绑定队列时消息会被丢弃。
         std::vector<std::string> routeDeadLetter(const std::string &source_qname,
                                                  const MessagePtr &msg)
         {

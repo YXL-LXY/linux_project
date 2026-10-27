@@ -12,6 +12,11 @@
 #include <utility>
 #include <vector>
 
+// QueueDispatcher 的并发行为测试：
+// - 多消费者竞争时消息不重复、分配公平；
+// - 消费者断线后 wait-ack 消息按原顺序重新入队；
+// - prefetch 限制在途消息数量；
+// - ACK 超时后重投并递增 delivery_count。
 struct DeliveryRecord {
     std::string consumer_tag;
     std::string message_id;

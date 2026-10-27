@@ -14,6 +14,12 @@
 
 namespace mq
 {
+    // 客户端连接。
+    //
+    // 一个 Connection 持有一条 TcpClient 和多个 Channel。TcpClient 使用
+    // AsyncWorker::loopthread 作为 IO 线程；收到的 basicConsumeResponse
+    // 会被投递到 AsyncWorker::pool，避免用户回调阻塞网络线程。
+    // 构造函数会阻塞到 TCP 连接建立完成。
     class Connection
     {
     public:
@@ -84,7 +90,10 @@ namespace mq
                 DLOG("未找到信道信息！");
                 return;
             }
-            // 2. 封装异步任务（消息处理任务），抛入线程池
+            // 2. 封装异步任务（消息处理任务），抛入线程池。
+            // 捕获 channel/message 的 shared_ptr，保证任务执行期间对象有效。
+            // 用户回调里的 ACK/Reject 会同步等待 broker 响应，因此不能放在
+            // IO 线程执行。
             _worker->pool.push([channel, message]()
                                { channel->consume(message); });
         }

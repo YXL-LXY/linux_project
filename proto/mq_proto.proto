@@ -3,6 +3,14 @@ package mq;
 
 import "mq_msg.proto";
 
+// 客户端/服务端协议约定：
+// - rid：请求 id，用来把 basicCommonResponse 和对应请求匹配起来；
+// - cid：信道 id，服务端用它找到 Connection 下的 Channel；
+// - consumer_tag：同一队列内区分消费者，连接断开时按它回滚 wait-ack 消息。
+//
+// 所有普通请求都返回 basicCommonResponse；basicConsume 成功时还会持续
+// 推送 basicConsumeResponse。客户端在同一信道上同步等待响应，最多 5 秒。
+
 //信道的打开与关闭
 message openChannelRequest{
     string rid = 1;
@@ -61,10 +69,10 @@ message basicPublishRequest {
     string rid = 1;
     string cid = 2;
     string exchange_name = 3;
-    string body = 4;
-    BasicProperties properties = 5;
+    string body = 4;                  // broker 不解释内容，按字节透传
+    BasicProperties properties = 5;   // 可选；缺少时 broker 自动补 id/routing_key
 };
-//消息的确认
+//消息的确认：只能确认当前消费者取走且仍在 wait-ack 中的消息
 message basicAckRequest {
     string rid = 1;
     string cid = 2;
@@ -72,12 +80,14 @@ message basicAckRequest {
     string message_id = 4;
 };
 //消费者的预取数量（QoS）
+// 0 = 不限制；N > 0 = 该消费者最多同时持有 N 条未 ACK 消息。
 message basicQosRequest {
     string rid = 1;
     string cid = 2;
     uint32 prefetch_count = 3;
 };
 //拒绝消息：requeue=true 重新入队，false 丢弃或进入死信队列
+// 达到 x-max-delivery-count 时，即使 requeue=true 也会转死信。
 message basicRejectRequest {
     string rid = 1;
     string cid = 2;
@@ -85,13 +95,13 @@ message basicRejectRequest {
     string message_id = 4;
     bool requeue = 5;
 };
-//队列的订阅
+//队列的订阅。一个信道最多一个消费者。
 message basicConsumeRequest {
     string rid = 1;
     string cid = 2;
     string consumer_tag  =3;
     string queue_name = 4;
-    bool auto_ack = 5;
+    bool auto_ack = 5; // true：回调返回后 broker 立即 ACK；false：由客户端显式 ACK/Reject
 };
 //订阅的取消
 message basicCancelRequest {
@@ -105,7 +115,7 @@ message basicConsumeResponse {
     string cid = 1;
     string consumer_tag = 2;
     string body = 3;
-    BasicProperties properties = 4;
+    BasicProperties properties = 4; // 包含服务端维护的 delivery_count
 };
 //通用响应
 message basicCommonResponse {

@@ -19,6 +19,18 @@ namespace mq
 {
 #define DBFILE "/meta.db"
 #define HOSTNAME "MyVirtualHost"
+
+    // broker 主对象：拥有网络服务器、协议分发器、VirtualHost、消费者表、
+    // 连接表、工作线程池和队列调度器。
+    //
+    // 线程模型：
+    // - _baseloop 负责 accept 和所有连接的 IO 事件；请求 handler 默认在这里串行执行；
+    // - _threadpool 只执行 QueueDispatcher 投递出来的消息回调，不执行协议解析；
+    // - _queue_dispatcher 的 notify() 可以从 IO 线程调用，实际投递在工作线程；
+    // - onAckTimeout 由 _baseloop 的定时器每秒触发一次。
+    //
+    // 因此网络与元数据操作主要在 IO 线程完成，只有可能阻塞/耗时的消费者
+    // 回调被放到线程池，避免阻塞其他连接。
     class Server
     {
     public:
@@ -80,6 +92,8 @@ namespace mq
         {
             _server.start();
             // 每秒扫描一次 wait-ack，处理 ACK 超时与死信。
+            // 定时器回调运行在 _baseloop，内部只做加锁扫描和 notify()，
+            // 真正重新投递仍由线程池完成，避免阻塞 IO。
             _baseloop.runEvery(1.0, std::bind(&Server::onAckTimeout, this));
             _baseloop.loop();
         }
@@ -331,6 +345,8 @@ namespace mq
             LOG_INFO << "onUnknownMessage: " << message->GetTypeName();
             conn->shutdown();
         }
+        // 定时器入口：扫描所有队列的 wait-ack，超时消息重新入队或转死信。
+        // 具体工作交给 QueueDispatcher，由它同步消费者在途计数并唤醒队列。
         void onAckTimeout()
         {
             if (_queue_dispatcher)
@@ -338,6 +354,8 @@ namespace mq
                 _queue_dispatcher->checkAckTimeout();
             }
         }
+        // 连接建立/断开。断开时删除 Connection，进而析构其下所有 Channel，
+        // Channel 析构函数负责把该消费者的 wait-ack 消息还回队列。
         void onConnection(const muduo::net::TcpConnectionPtr &conn)
         {
             if (conn->connected())

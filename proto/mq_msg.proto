@@ -1,33 +1,38 @@
 syntax = "proto3";
 package mq;
 
+// 交换机类型。Router 按这里的类型选择路由规则。
 enum ExchangeType {
     UNKNOWTYPE = 0;
-    DIRECT = 1; //直接交换
-    FANOUT = 2; //广播交换
-    TOPIC = 3; //主题交换
+    DIRECT = 1; // 精确匹配：routing key == binding key
+    FANOUT = 2; // 广播：忽略 routing key，投递给所有绑定队列
+    TOPIC = 3;  // 通配符匹配：* 匹配一个单词，# 匹配零个或多个单词
 };
 
+// 消息持久化模式。
+// 注意：最终能否落盘还取决于目标队列是否 durable，见 MsgQueueManager。
 enum DeliveryMode {
     UNKNOWMODE = 0;
-    UNDURABLE = 1;
-    DURABLE = 2;
+    UNDURABLE = 1; // 只放内存，broker 重启后丢失
+    DURABLE = 2;   // 目标队列 durable 时写入 .mqd 文件
 };
 
 message BasicProperties{
-    string id = 1;
-    DeliveryMode delivery_mode = 2;//持久化模式 1-非持久化； 2-持久化
-    string routing_key = 3;
-    uint32 delivery_count = 4;//该消息被投递的次数，用于失败重投/死信判断
+    string id = 1;                       // broker 内唯一消息 id；为空时由 broker 生成
+    DeliveryMode delivery_mode = 2;      // 持久化模式 1-非持久化；2-持久化
+    string routing_key = 3;              // 发布时用于匹配 binding key
+    // 该消息被投递的次数。由 broker 在每次 basicConsume 时自增，
+    // 用于 x-max-delivery-count 和死信判断；进入死信队列后重置为 0。
+    uint32 delivery_count = 4;
 };
 
 message Message {
     message Payload {
-        BasicProperties properties = 1; //消息属性
-        string body = 2;
-        string valid = 3; //是否有效
+        BasicProperties properties = 1; // 消息属性
+        string body = 2;                // 消息体；对新 bridge 来说可以是二进制 envelope
+        string valid = 3;               // "1"=有效；"0"=已 ACK/丢弃，等待 GC
     };
-    Payload payload = 1; //有效载荷
-    uint32 offset = 2; //偏移量
-    uint32 length = 3;
+    Payload payload = 1; // 有效载荷
+    uint32 offset = 2;   // 持久化文件中 payload 的起始偏移（由 MessageMapper 维护）
+    uint32 length = 3;   // 持久化文件中 payload 的字节长度
 };

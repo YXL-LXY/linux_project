@@ -12,13 +12,16 @@
 
 namespace mq
 {
+    // 队列元数据。durable=true 的队列会把元数据写入 SQLite，
+    // 并在启动时恢复；exclusive/auto_delete 目前只作为字段保存，
+    // 尚未实现独占连接和自动删除语义。
     struct MsgQueue
     {
         using ptr = std::shared_ptr<MsgQueue>;
         std::string name;
         bool durable;
-        bool exclusive; //是否独占
-        bool auto_delete;
+        bool exclusive; // 是否独占（字段已保存，行为尚未实现）
+        bool auto_delete; // 是否自动删除（字段已保存，行为尚未实现）
         google::protobuf::Map<std::string, std::string> args;
 
         MsgQueue() {}
@@ -32,6 +35,8 @@ namespace mq
         {
         }
 
+        // 数据库中的 args 以 "k1=v1&k2=v2&" 的字符串保存。
+        // 注意：当前实现不做 URL 编码，参数值中不能包含 '&'。
         void setArgs(const std::string &str_args)
         {
             std::vector<std::string> sub_args;
@@ -178,6 +183,9 @@ namespace mq
     }
 
     using QueueMap = std::unordered_map<std::string, MsgQueue::ptr>;
+
+    // 队列元数据的 SQLite 持久化。
+    // queue_table 只保存 durable 队列；非持久化队列仅存在于内存。
     class MsgQueueMapper
     {
     public:
@@ -259,6 +267,11 @@ namespace mq
         SqliteHelper _sql_helper;
     };
 
+    // 队列元数据管理器。
+    //
+    // declareQueue 是幂等的：队列已存在时只更新本次声明显式携带的合法参数，
+    // 不会清空消息，也不会用空 args 覆盖已有配置。只有 durable 队列的
+    // 参数变化才写回 SQLite。
     class MsgQueueManager
     {
     public:
@@ -352,6 +365,8 @@ namespace mq
                 _mapper.remove(name);
             _msg_queues.erase(name);
         }
+        // 返回 shared_ptr，调用方在锁外仍可安全读取队列元数据；
+        // 删除队列只会把 map 中的条目摘掉，不会让正在使用的对象失效。
         MsgQueue::ptr selectQueue(const std::string &name)
         {
             std::unique_lock<std::mutex> lock(_mutex);
@@ -362,6 +377,7 @@ namespace mq
             }
             return it->second;
         }
+        // 返回一份队列表快照，供 ACK 超时扫描等需要遍历的场景使用。
         QueueMap allQueues()
         {
             std::unique_lock<std::mutex> lock(_mutex);

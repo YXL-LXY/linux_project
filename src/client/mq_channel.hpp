@@ -20,11 +20,23 @@ namespace mq
     using ProtobufCodecPtr = std::shared_ptr<ProtobufCodec>;
     using basicConsumeResponsePtr = std::shared_ptr<basicConsumeResponse>;
     using basicCommonResponsePtr = std::shared_ptr<basicCommonResponse>;
+
+    // 客户端信道。
+    //
+    // 调用线程通过 _codec->send() 发出请求，然后在 _basic_resp 条件变量上
+    // 等待对应 rid 的 basicCommonResponse，最多 5 秒。网络线程收到响应后
+    // 调用 putBasicResponse() 唤醒等待者。
+    //
+    // _consumer 单独用 _consumer_mutex 保护，因为：
+    // - consume() 在网络线程读取 _consumer 并执行回调；
+    // - basicConsume()/basicCancel()/析构函数可能在用户线程修改它。
+    // 回调本身由调用方（如 AsyncWorker 的线程池）执行，不在信道锁内。
     class Channel
     {
     public:
         using ptr = std::shared_ptr<Channel>;
         Channel(const muduo::net::TcpConnectionPtr &conn, const ProtobufCodecPtr &codec) : _cid(UUIDHelper::uuid()), _conn(conn), _codec(codec) {}
+        // 析构时尽力取消订阅，让 broker 归还 wait-ack 消息。
         ~Channel() { basicCancel(); }
         std::string cid() { return _cid; }
         bool openChannel()
@@ -139,6 +151,9 @@ namespace mq
             return;
         }
 
+        // 发布消息。
+        // 当前只等待 broker 的“路由处理完成”响应，不提供 Publisher Confirm：
+        // 服务端持久化失败等错误不会通过返回值区分。
         void basicPublish(
             const std::string &ename,
             const BasicProperties *bp,
@@ -355,6 +370,7 @@ namespace mq
         std::unordered_map<std::string, basicCommonResponsePtr> _basic_resp;
     };
 
+    // 客户端连接内的信道表。cid 由客户端生成，服务端原样带回。
     class ChannelManager
     {
     public:

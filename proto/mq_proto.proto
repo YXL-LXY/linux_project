@@ -69,7 +69,7 @@ message basicPublishRequest {
     string rid = 1;
     string cid = 2;
     string exchange_name = 3;
-    string body = 4;                  // broker 不解释内容，按字节透传
+    bytes body = 4;                   // broker 不解释内容，按字节透传
     BasicProperties properties = 5;   // 可选；缺少时 broker 自动补 id/routing_key
 };
 //消息的确认：只能确认当前消费者取走且仍在 wait-ack 中的消息
@@ -114,7 +114,7 @@ message basicCancelRequest {
 message basicConsumeResponse {
     string cid = 1;
     string consumer_tag = 2;
-    string body = 3;
+    bytes body = 3;
     BasicProperties properties = 4; // 包含服务端维护的 delivery_count
 };
 //通用响应

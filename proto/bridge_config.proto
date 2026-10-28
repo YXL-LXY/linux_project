@@ -1,0 +1,83 @@
+syntax = "proto3";
+
+package mq.bridge;
+
+// Bridge 的配置使用 protobuf text format 保存，避免为了配置再引入
+// YAML/JSON 依赖。示例见 config/bridge.conf.example。
+//
+// 这些消息只属于 mq_bridge 进程，broker 不依赖该文件。
+// 字段值的解析/默认值/交叉校验由 BridgeConfigLoader 负责；proto 文件本身
+// 只描述数据结构。
+
+// 数据方向。
+enum BridgeDirection {
+    DIRECTION_UNSPECIFIED = 0;
+    MQ_TO_ROS2 = 1;       // 从 MQ 队列消费，发布到 ROS2 topic
+    ROS2_TO_MQ = 2;       // 订阅 ROS2 topic，发布到 MQ exchange
+    BIDIRECTIONAL = 3;    // 两个方向都启用（需要同时配置 queue 和 exchange）
+}
+
+// ROS2 reliability 的最小集合。
+enum BridgeReliability {
+    RELIABILITY_UNSPECIFIED = 0;
+    BEST_EFFORT = 1;
+    RELIABLE = 2;
+}
+
+// ROS2 durability 的最小集合。
+enum BridgeDurability {
+    DURABILITY_UNSPECIFIED = 0;
+    VOLATILE = 1;
+    TRANSIENT_LOCAL = 2;
+}
+
+// bridge 声明 MQ exchange 时使用的类型。
+//
+// 单独定义而不直接复用 mq.ExchangeType，是为了让配置层保持自描述，并且
+// 允许以后 bridge 支持 MQTT 等其它 broker 时只扩展映射，不改变配置格式。
+enum BridgeExchangeType {
+    EXCHANGE_UNSPECIFIED = 0;
+    EXCHANGE_DIRECT = 1;   // routing key 精确匹配
+    EXCHANGE_FANOUT = 2;   // 广播到所有绑定队列
+    EXCHANGE_TOPIC = 3;    // 通配符匹配，默认值
+}
+
+// retained store 是 bridge 自己维护的最近状态缓存，不属于 broker 队列。
+// 它用于 ROS2 transient_local / 晚加入订阅者的“最近一条”语义，不参与
+// broker 的 ACK、重投或持久化消息语义。
+message RetainedStoreConfig {
+    bool enabled = 1;
+    uint32 capacity_per_topic = 2;  // 每个 topic 保留多少条，默认 1
+    uint32 ttl_sec = 3;             // 0 表示不过期
+    string persist_path = 4;        // 为空表示只存内存；写盘使用临时文件 + rename
+}
+
+// 一个 ROS2 topic 与 MQ 路由之间的映射。
+// 同一个 topic 只能出现一次；BIDIRECTIONAL 时 queue 和 exchange 都必需。
+message TopicConfig {
+    string name = 1;              // ROS2 topic 名，例如 /imu/data
+    string ros_type = 2;          // 例如 sensor_msgs/msg/Imu
+    BridgeDirection direction = 3;
+    string exchange = 4;          // ROS2_TO_MQ 时发布到该 exchange
+    string routing_key = 5;       // ROS2_TO_MQ 时的 routing key
+    string queue = 6;             // MQ_TO_ROS2 时消费该队列
+    // RELIABLE 在 MQ 侧对应手动 ACK；BEST_EFFORT 对应 auto_ack。
+    BridgeReliability reliability = 7;
+    // TRANSIENT_LOCAL 在 retained store 启用时也会写入 bridge 最近状态缓存；
+    // 晚加入订阅者是否收到仍由 ROS2 DDS 的 durability 决定。
+    BridgeDurability durability = 8;
+    uint32 depth = 9;             // ROS2 history depth；0 表示使用默认值 10
+    bool retained = 10;           // 是否把最近一条写入 retained store（仅 MQ_TO_ROS2）
+    map<string, string> queue_args = 11;  // 额外的 MQ 队列参数，例如 x-max-length
+    // 声明 MQ exchange 时使用的类型；未填时默认 EXCHANGE_TOPIC。
+    // 同一个 exchange 被多个 topic 引用时必须保持一致。
+    BridgeExchangeType exchange_type = 12;
+}
+
+message BridgeConfig {
+    string node_name = 1;
+    string mq_host = 2;
+    uint32 mq_port = 3;
+    RetainedStoreConfig retained_store = 4;
+    repeated TopicConfig topics = 5;
+}

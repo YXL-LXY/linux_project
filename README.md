@@ -6,8 +6,12 @@
 项目目标是**把消息队列的核心链路讲清楚、跑起来**，而不是做一个生产级中间件。
 当前版本适合作为 C++ 网络编程 / 后端实习项目的作品集。
 
-> 完整架构、协议、并发模型、持久化和 ROS2 Bridge MVP 规划见 [PROJECT.md](PROJECT.md)。
+> 完整架构、协议、并发模型、持久化和 ROS2 Bridge 说明见 [PROJECT.md](PROJECT.md)。
 > 本文档保留为快速开始和常用命令参考。
+>
+> 当前 ROS2 Bridge 已接通双向数据面：`mq_bridge` 会声明 MQ 拓扑、消费队列并
+> 发布到 ROS2，也会把 ROS2 消息封装成 `BridgeEnvelope` 后发布到 MQ。仍没有
+> 自动重连、Publisher Confirm 和监控指标，详见文末“已知限制”。
 
 ## 架构
 
@@ -60,13 +64,18 @@ publish
 ├── CMakeLists.txt          # 顶层构建脚本
 ├── cmake/
 │   └── RunTest.cmake       # 为每个测试复制独立的数据目录
+├── config/
+│   └── bridge.conf.example # ROS2 bridge 配置示例（protobuf text format）
 ├── proto/
 │   ├── mq_msg.proto        # 消息、属性、交换机类型
-│   └── mq_proto.proto      # 客户端与服务器之间的请求/响应
+│   ├── mq_proto.proto      # 客户端与服务器之间的请求/响应
+│   ├── bridge_config.proto # bridge 配置、方向、QoS
+│   └── bridge_envelope.proto
 ├── src/
 │   ├── common/             # 日志、文件/SQLite 工具、线程池
 │   ├── server/             # broker：连接、信道、交换机、队列、绑定、消息存储
-│   └── client/             # 客户端库 + publish/consume 示例
+│   ├── client/             # 客户端库 + publish/consume 示例
+│   └── bridge/             # 独立 mq_bridge 数据面（可选 rclcpp）
 ├── tests/                  # GoogleTest 单元测试 + SQLite 测试数据
 ├── third_party/
 │   └── muduo/              # 预编译的 muduo 头文件与静态库（x86-64 Linux）
@@ -93,6 +102,7 @@ sudo apt install -y \
 - 支持 C++11 的编译器（GCC 7+ / Clang 6+）
 - protobuf >= 3.x
 - `third_party/muduo` 中自带 muduo 头文件和静态库，不需要单独安装 muduo
+- 可选：ROS2 Humble（只有 `MQ_BUILD_ROS2_BRIDGE=ON` 时需要；bridge 目标使用 C++17）
 
 > muduo 静态库目前是 **x86-64 Linux** 下编译的。如果你在 ARM 或 macOS 上构建，
 > 需要自己重新编译 muduo，并替换 `third_party/muduo/lib`。
@@ -110,6 +120,7 @@ cmake --build build -j
 build/bin/mqserver
 build/bin/publish_client
 build/bin/consume_client
+build/bin/mq_bridge
 build/bin/mq_*test
 ```
 
@@ -125,7 +136,16 @@ cmake --build build -j
 
 # Release 构建
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+# 打开 ROS2 bridge（需要 ROS2 Humble；bridge 目标使用 C++17）
+cmake -S . -B build-ros2 \
+    -DMQ_BUILD_ROS2_BRIDGE=ON \
+    -DCMAKE_PREFIX_PATH=/opt/ros/humble
+cmake --build build-ros2 -j
 ```
+
+`MQ_BUILD_ROS2_BRIDGE` 默认关闭，broker 本身始终保持 C++11 且不链接 ROS2。
+关闭时 `mq_bridge` 仍可构建，但只能做配置校验；`--run` 会提示没有 ROS2 支持。
 
 protobuf 的 `.pb.cc/.pb.h` 在构建时生成到 `build/`，不提交到仓库。
 
@@ -182,6 +202,39 @@ consumer1消费了消息：Hello Bite
 - `queue1` 的 binding key 是 `queue1`
 - `queue2` 的 binding key 是 `news.music.#`
 - `publish_client` 使用的 routing key 是 `news.music.pop`，所以消息会进入 `queue2`
+
+## ROS2 bridge 数据面
+
+先校验配置并查看 bridge 计划：
+
+```bash
+./build/bin/mq_bridge --config config/bridge.conf.example --check-config
+```
+
+打开 ROS2 支持后启动数据面（broker 需要先运行并监听配置中的端口）：
+
+```bash
+./build-ros2/bin/mq_bridge --config config/bridge.conf.example --run
+```
+
+`--run` 会完成以下工作：
+
+- 连接 MQ broker，按配置声明 exchange、queue 和 binding；
+- 为 `MQ_TO_ROS2` 创建 generic publisher 和 MQ 消费者；
+- 为 `ROS2_TO_MQ` 创建 generic subscriber，把 CDR 封装成
+  `BridgeEnvelope` 后发布到 MQ；
+- 在启动时从 retained store 回放最近状态；
+- 用独立串行任务线程执行跨域 publish/ACK/Reject，避免阻塞 ROS2 executor。
+
+MQ → ROS2 使用手动 ACK 时，只有 ROS2 publish 成功后才 ACK；失败会
+`reject(requeue=true)`。ROS2 → MQ 当前没有 Publisher Confirm，因此只能提供
+at-most-once 的发布保证：publish 请求失败会记录日志，但无法证明消息一定
+没有进入某个队列。
+
+配置使用 protobuf text format，示例见
+[`config/bridge.conf.example`](config/bridge.conf.example)。`exchange_type`
+可选 `EXCHANGE_DIRECT`、`EXCHANGE_FANOUT`、`EXCHANGE_TOPIC`，默认后者。
+同一个 exchange 被多个 topic 引用时必须使用相同类型。
 
 ## QoS、失败重投和死信
 
@@ -266,6 +319,7 @@ ctest --test-dir build -R mq_routetest --output-on-failure
 - 支持队列参数 `x-max-length`、`x-ack-timeout-ms`、`x-max-delivery-count`、`x-dead-letter-exchange`、`x-dead-letter-routing-key`；durable 队列会随元数据持久化这些参数
 - 消费者回调使用 `weak_ptr`，避免 Channel 析构后的悬空指针；调度任务持有 dispatcher 的 `shared_ptr`，线程池使用 `weak_ptr` 避免循环引用
 - 客户端请求等待响应最多 5 秒，超时返回失败而不是永久阻塞
+- 独立 `mq_bridge`：声明 MQ 拓扑、MQ → ROS2、ROS2 → MQ、retained 启动回放、串行任务线程和手动 ACK/Reject
 - GoogleTest 单元测试与 CTest 集成
 
 ## 已知限制
@@ -276,11 +330,13 @@ ctest --test-dir build -R mq_routetest --output-on-failure
 - **只实现了单条 `basicReject`**：没有 `basicNack(multiple)`，也不支持批量确认；消费端需要自己记录失败消息 id。
 - **ACK 超时和死信是 at-least-once**：超时/断线都会重投，不是 exactly-once；消费端仍需要保证操作幂等。
 - **`delivery_count` 没有持久化**：它保存在消息运行时属性里，服务重启后会从 0 开始；持久化消息体会恢复，但重投次数不会。
-- **没有 latched / retained 语义**：队列是“消费即出队”的工作队列，不会为每个新订阅者保留最近一条或最近 N 条副本。ROS2 latched topic 这类“最新状态”需求应放到未来的 bridge 中用 retained-state 缓存实现，而不是把队列改成回放日志。
+- **broker 没有 latched / retained 语义**：队列是“消费即出队”的工作队列，不会为每个新订阅者保留最近一条或最近 N 条副本。ROS2 latched / transient-local 的“最新状态”需求由 bridge 的 retained store 单独处理，不改变 broker 队列语义。
 - **`x-max-length` 只约束待推送消息**：已经被消费者取走但尚未 ACK 的消息不计入上限，所以消费者长期不 ACK 时，队列里的消息总量仍可能超过上限。
 - **死信配置要避免环路**：如果死信交换机又把消息路由回源队列，可能形成反复投递；当前没有死信跳数/循环检测。
 - **没有大包零拷贝 / 共享内存**：消息体统一走 protobuf 和 TCP。
-- **没有 ROS2 bridge**：还没有和 `rclcpp` 的 QoS 做映射。
+- **ROS2 bridge 没有自动重连**：broker 断开后进程会继续运行，但不会自动恢复连接和拓扑；需要重启 bridge。启动时如果 broker 不可达，客户端连接建立也没有超时，可能会阻塞；请先启动 broker。当前没有 Publisher Confirm，ROS2 → MQ 是 at-most-once。
+- **bridge 的 QoS 只是子集**：只映射 reliability/durability/history depth，deadline、liveliness、lease 等 DDS 特性没有实现；不会自动改写已有队列参数。
+- **双向配置可能回环**：ROS2 → MQ 发布到的队列如果又被同一 bridge 的 MQ → ROS2 消费，消息会循环；示例配置用不同的 routing key 和队列避免这个问题。
 - **没有监控面板**：没有 Prometheus / Grafana，只有日志。
 - **请求超时不等于请求没执行**：客户端 5 秒没收到响应会返回失败，但服务端可能已经处理了请求。
 - **没有 TLS、鉴权、权限控制**：默认只适合本地学习。
@@ -290,10 +346,11 @@ ctest --test-dir build -R mq_routetest --output-on-failure
 
 按优先级建议继续做：
 
-1. 把 retained-state（最近状态）、ROS2 QoS 映射和 topic/service 桥接放到独立的 bridge 进程；broker 继续保持 ROS2 无关
+1. 补 bridge 自动重连：连接断开后重新连接、恢复 consumer 和拓扑，并记录重连次数
 2. 写一个 100Hz IMU + 大包图像的 demo，并补一张吞吐/延迟表
-3. 可选：补监控指标（队列深度、消费者数、未确认数、超时/死信计数）
-4. 可选：补 `basicNack(multiple)`、Publisher Confirm 和更有针对性的持久化重投计数
+3. 补 bridge 集成测试：真实 broker + ROS2 pub/sub 的双向链路、retained 回放和失败重投
+4. 可选：补监控指标（队列深度、消费者数、未确认数、超时/死信计数、bridge 转发计数）
+5. 可选：补 `basicNack(multiple)`、Publisher Confirm 和更有针对性的持久化重投计数
 
 ## License
 

@@ -7,9 +7,12 @@
 >
 > - 第 1 步：队列调度器、竞争消费、断线重投——**已实现**
 > - 第 2 步：prefetch/QoS、Reject、ACK 超时、死信队列、队列参数持久化——**已实现**
-> - 第 3 步：ROS2 Bridge MVP——**仅完成方案设计，尚未实现**
+> - 第 3 步：ROS2 Bridge MVP——**双向数据面已实现，稳定运行能力仍有限**
 >
-> 文中标注“规划中”的内容目前不在代码中，不能按已实现功能使用。
+> 独立 `mq_bridge` 会声明 MQ 拓扑、消费队列并发布到 ROS2，也会把 ROS2 消息
+> 封装成 `BridgeEnvelope` 后发布到 MQ。配置、QoS 近似映射、retained 启动回放、
+> 手动 ACK/Reject 和串行任务线程均已接通；自动重连、Publisher Confirm、
+> 监控指标和自动化 ROS2 集成测试仍未实现。
 
 ---
 
@@ -74,7 +77,7 @@
 
 - C++ 网络编程 / 后端方向的完整作品集项目；
 - 学习消息队列核心机制的可运行样例；
-- 后续接入 ROS2 的 broker 基础。
+- 演示 broker 与 ROS2 bridge 解耦、独立部署的示例。
 
 当前版本不适合：
 
@@ -106,14 +109,18 @@
 | 死信队列 | 通过 `x-dead-letter-exchange` 路由死信 |
 | x-max-length | 就绪消息超限时丢弃最旧消息 |
 | 持久化 | SQLite 保存元数据，`.mqd` 文件保存消息体 |
+| 二进制消息体 | `Message.Payload.body` / publish / consume 的 body 使用 protobuf `bytes`，可承载 CDR/envelope |
 | 客户端超时 | 请求最多等待 5 秒，避免永久阻塞 |
+| ROS2 Bridge 数据面 | 独立 `mq_bridge`：拓扑声明、MQ ↔ ROS2 双向转发、手动 ACK/Reject、retained 启动回放 |
+| bridge 执行模型 | MQ/ROS2 回调只投递任务，跨域 publish/ACK 在单独串行线程执行 |
 | 单元测试 | GoogleTest + CTest，测试使用独立数据目录 |
 
 ### 2.2 尚未实现
 
 | 能力 | 状态 |
 | --- | --- |
-| ROS2 Bridge MVP | **规划中，未实现** |
+| bridge 自动重连 | 未实现；broker 断开后需要重启 bridge |
+| bridge 自动化集成测试 | 未实现；当前用真实 broker + ROS2 手工 smoke test |
 | Publisher Confirm / mandatory / return | 未实现 |
 | basicNack / 批量 ACK | 未实现 |
 | 消息 TTL、优先级队列 | 未实现 |
@@ -194,6 +201,10 @@
 | `ConsumerManager` | 全局消费者注册表，按队列管理消费者 |
 | `QueueDispatcher` | 队列到消费者的调度、prefetch 控制、竞争消费、超时唤醒 |
 | `threadpool` | 执行消费者回调；默认 1 个工作线程 |
+| `mq_bridge` | 独立进程；不链接进 broker，按需启用 rclcpp |
+| `BridgeRuntime` | bridge 编排：拓扑声明、双向转发、retained 回放、任务队列和生命周期 |
+| `MqClientAdapter` | 复用现有客户端库，封装 connect/declare/publish/consume，不感知 ROS2 |
+| `RclcppRos2Bridge` | generic publisher/subscriber，只处理序列化字节 |
 
 ### 3.3 目录结构
 
@@ -207,7 +218,11 @@
 │   └── RunTest.cmake           # 为每个 CTest 目标准备独立数据目录
 ├── proto/
 │   ├── mq_msg.proto            # Message、Payload、BasicProperties、ExchangeType
-│   └── mq_proto.proto          # 客户端/服务端请求与响应
+│   ├── mq_proto.proto          # 客户端/服务端请求与响应
+│   ├── bridge_config.proto     # bridge 配置、方向、QoS、retained store
+│   └── bridge_envelope.proto   # BridgeEnvelope 与 retained 持久化记录
+├── config/
+│   └── bridge.conf.example     # bridge 的 protobuf text 配置示例
 ├── src/
 │   ├── common/
 │   │   ├── mq_helper.hpp       # 文件、SQLite、UUID、字符串工具
@@ -226,12 +241,21 @@
 │   │   ├── mq_consumer.hpp     # Consumer / QueueConsumer / ConsumerManager
 │   │   ├── mq_dispatcher.hpp   # QueueDispatcher
 │   │   └── mq_route.hpp        # DIRECT / FANOUT / TOPIC 路由
-│   └── client/
+│   ├── client/
 │       ├── mq_connection.hpp   # 客户端 Connection / Channel 管理
 │       ├── mq_channel.hpp      # 客户端 Channel：同步请求、消费者、ACK
 │       ├── mq_worker.hpp       # 客户端 IO 线程 + 回调线程池
 │       ├── publish_client.cc   # 发布示例
 │       └── consume_client.cc   # 消费示例
+│   └── bridge/
+│       ├── main.cc             # --check-config / --run
+│       ├── bridge_config.*     # protobuf text 解析、默认值、校验
+│       ├── bridge_runtime.*    # 拓扑、双向转发、retained 回放、任务队列
+│       ├── envelope_codec.*    # BridgeEnvelope 编解码/版本检查
+│       ├── qos_mapper.*        # ROS2 QoS <-> MQ 近似映射
+│       ├── retained_store.*    # 线程安全的最近状态缓存
+│       ├── mq_client_adapter.* # 现有 MQ 客户端薄封装
+│       └── ros2_bridge.*       # rclcpp generic pub/sub 或 stub
 ├── tests/                      # GoogleTest 单元测试与测试数据
 ├── third_party/
 │   └── muduo/                  # 预编译 muduo 头文件和静态库
@@ -257,7 +281,7 @@ message BasicProperties {
 message Message {
     message Payload {
         BasicProperties properties = 1;
-        string body = 2;
+        bytes body = 2;
         string valid = 3;
     };
     Payload payload = 1;
@@ -274,13 +298,17 @@ message Message {
 | `delivery_mode` | `UNDURABLE` 或 `DURABLE`；最终是否落盘还取决于目标队列 |
 | `routing_key` | 发布时用于匹配 binding key |
 | `delivery_count` | 该消息被投递的次数；broker 维护，发布端设置会被覆盖为 0 |
-| `body` | 消息体，broker 按字节透传，不解释内容 |
+| `body` | 消息体，protobuf `bytes`；broker 按字节透传，不解释内容，可承载二进制 CDR/envelope |
 | `valid` | 持久化文件中 `"1"` 有效、`"0"` 无效（待 GC） |
 | `offset` / `length` | 消息 payload 在 `.mqd` 文件中的位置，由 `MessageMapper` 维护 |
 
 > 重要：消息是否持久化不是只看 `delivery_mode`。
 > 只有“目标队列 `durable=true` 且消息 `DURABLE`”才会写入 `.mqd`；
 > 队列不 durable 时，消息会被强制当作 `UNDURABLE`。
+
+> `body` 从 `string` 改为 `bytes` 是 wire-compatible 的：两者都使用
+> length-delimited 编码，tag 和长度不变；但 `bytes` 不会做 UTF-8 校验，
+> 因此 BridgeEnvelope 中的二进制 CDR 可以安全通过 publish/consume。
 
 ### 4.2 交换机与路由
 
@@ -711,6 +739,22 @@ AsyncWorker
 客户端收到 `basicConsumeResponse` 后，把 `channel->consume()` 投递到线程池，
 用户回调不在网络线程执行。这样回调中的同步 ACK/Reject 不会阻塞 IO。
 
+bridge：
+
+```text
+MQ AsyncWorker pool ──onMqMessage──┐
+                                  ├──▶ BridgeRuntime::TaskQueue（单线程串行）
+ROS2 executor ──onRos2Message─────┘
+                                         │
+                                         ├─ ROS2 publish
+                                         ├─ MQ publish
+                                         └─ ACK / Reject
+```
+
+两个方向的回调都只做轻量复制和入队，不在 MQ 回调线程或 ROS2 executor
+线程里执行同步网络请求。任务队列上限 4096；满时 MQ → ROS2 走
+`reject(requeue=true)`，ROS2 → MQ 只能记录后丢弃（没有 Publisher Confirm）。
+
 ### 8.2 主要锁
 
 | 锁 | 保护对象 | 说明 |
@@ -724,6 +768,10 @@ AsyncWorker
 | `ConnectionManager::_mutex` | `_conns` | TCP 连接表 |
 | 客户端 `Channel::_mutex` | `_basic_resp` | 请求响应等待 |
 | 客户端 `Channel::_consumer_mutex` | `_consumer` | 消费者生命周期 |
+| `BridgeRuntime::TaskQueue::_mutex` | 任务 deque / running 状态 | 串行任务队列 |
+| `MqClientAdapter::Impl::mutex` | 连接、信道、消费者信道 | 同步网络请求串行化 |
+| `RclcppRos2Bridge::_publish_mutex` | publisher 表 | 任务线程发布 |
+| `RclcppRos2Bridge::_handler_mutex` | 消息 handler | 设置/读取回调 |
 
 ### 8.3 锁顺序与避免嵌套
 
@@ -756,6 +804,11 @@ MessageManager::_mutex
   保证线程池任务执行期间对象有效。
 - `ConnectionManager` 删除连接后，最后一个 `shared_ptr` 释放会触发
   `Connection -> Channel` 的析构清理。
+- `BridgeRuntime::stop()` 先清 `_running`、停止任务线程，再 `basicCancel`
+  取消 MQ 消费者，最后销毁 ROS2 node；这样 in-flight 任务仍能安全访问
+  适配器，未处理的 MQ 消息由 broker 重新投递。
+- `RclcppRos2Bridge` 的 subscription 回调按值捕获 `TopicConfig`，不持有
+  `BridgeConfig` 的引用；运行时回调通过 `BridgeRuntime*` 回到编排器。
 
 ### 8.5 调度器状态机
 
@@ -924,6 +977,7 @@ cmake --build build -j
 build/bin/mqserver
 build/bin/publish_client
 build/bin/consume_client
+build/bin/mq_bridge
 build/bin/mq_*test
 ```
 
@@ -940,6 +994,20 @@ cmake --build build -j
 # Release
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 ```
+
+ROS2 bridge 默认不链接 rclcpp，需要显式打开，并让 CMake 找到 ROS2：
+
+```bash
+# 已安装 ROS2 Humble 时
+cmake -S . -B build-ros2 \
+    -DMQ_BUILD_ROS2_BRIDGE=ON \
+    -DCMAKE_PREFIX_PATH=/opt/ros/humble
+cmake --build build-ros2 -j
+```
+
+关闭时 `mq_bridge` 仍会构建，但只支持 `--check-config`；
+`--run` 会明确提示没有编译 ROS2 支持。打开后 bridge 目标使用 C++17，
+broker 目标仍保持 C++11。
 
 protobuf 生成的 `.pb.cc/.pb.h` 在构建目录中，不提交到仓库。
 
@@ -981,7 +1049,49 @@ protobuf 生成的 `.pb.cc/.pb.h` 在构建目录中，不提交到仓库。
 - `queue2` 绑定 key `news.music.#`；
 - `publish_client` 使用 `news.music.pop`，消息进入 `queue2`。
 
-### 10.4 测试
+### 10.4 ROS2 bridge 数据面
+
+校验配置并打印 topic 计划：
+
+```bash
+./build/bin/mq_bridge --config config/bridge.conf.example --check-config
+```
+
+打开 ROS2 支持后，先启动 broker，再启动双向数据面：
+
+```bash
+./build/bin/mqserver ./data/ 8085
+./build-ros2/bin/mq_bridge --config config/bridge.conf.example --run
+```
+
+`--run` 的实际行为：
+
+- 连接 MQ broker，按 topic 配置声明 exchange、queue 和 binding；
+- `MQ_TO_ROS2`：创建 generic publisher，消费 MQ 队列，解码
+  `BridgeEnvelope`，把 `cdr` 原样发布到 ROS2；
+- `ROS2_TO_MQ`：创建 generic subscription，把 CDR 封装成
+  `BridgeEnvelope`，发布到配置的 exchange/routing key；
+- 启动时加载 retained store，并在创建 ROS2 端点后回放最近状态；
+- MQ 手动 ACK 模式下，只有 ROS2 publish 成功才 ACK；失败
+  `reject(requeue=true)`；无法解析或 topic/type 不匹配的毒消息
+  `reject(requeue=false)`；
+- 两个方向统一投递到 bridge 串行任务线程，避免阻塞 ROS2 executor 或
+  MQ 回调线程。
+
+配置文件使用 protobuf text format，示例见
+[`config/bridge.conf.example`](config/bridge.conf.example)。`exchange_type`
+支持 `EXCHANGE_DIRECT`、`EXCHANGE_FANOUT`、`EXCHANGE_TOPIC`，未填时默认
+`EXCHANGE_TOPIC`；同一个 exchange 被多个 topic 引用时必须保持一致。
+
+当前边界：
+
+- ROS2 → MQ 没有 Publisher Confirm，是 at-most-once；发布请求失败只记录日志；
+- broker 断开后不会自动重连；
+- bridge 的 retained store 是 bridge 自己的辅助状态，不参与 broker
+  ACK/重投；
+- 当前没有自动化真实 ROS2 集成测试，使用手工 smoke test 验证。
+
+### 10.5 测试
 
 ```bash
 ctest --test-dir build --output-on-failure
@@ -996,7 +1106,7 @@ ctest --test-dir build -R mq_routetest --output-on-failure
 每个测试都会在 `build/test-run/<test_name>/` 下获得一份独立的
 `tests/data` 副本，避免 SQLite 状态互相污染。
 
-当前 CTest 共有 11 个目标：
+当前 CTest 共有 13 个目标：
 
 | 测试 | 覆盖内容 |
 | --- | --- |
@@ -1007,25 +1117,36 @@ ctest --test-dir build -R mq_routetest --output-on-failure
 | `mq_dispatchertest` | 竞争消费、断线重投、prefetch、ACK 超时 |
 | `mq_exchangetest` | 交换机基本操作 |
 | `mq_filetest` | 文件工具 smoke test |
-| `mq_hosttest` | VirtualHost、max-length、durable ACK、Reject、超时、死信 |
+| `mq_hosttest` | VirtualHost、max-length、durable ACK、Reject、超时、死信、二进制 body |
 | `mq_msgtest` | 消息插入、持久化、max-length |
 | `mq_queuetest` | 队列参数解析、声明更新 |
 | `mq_routetest` | DIRECT/TOPIC 路由 key 合法性 |
+| `mq_bridge_coretest` | 配置解析/校验、exchange_type、envelope 往返、QoS 映射、retained store、BridgeRuntime 启动前校验 |
+| `mq_bridge_config_check` | 示例配置通过 CLI `--check-config` |
 
 说明：
 
 - `mq_channeltest`、`mq_connectiontest`、`mq_filetest` 目前更接近 smoke test，
   不是完整的行为测试。
 - 核心行为覆盖主要在 `mq_dispatchertest` 和 `mq_hosttest`。
+- `mq_bridge_coretest` 只覆盖纯内存/协议部分；真实 MQ ↔ ROS2 链路目前用
+  手工 smoke test 验证，自动化集成测试待补。
 
-### 10.5 当前验证结果
+### 10.6 当前验证结果
 
-在本次注释完善后：
+在 ROS2 bridge 双向数据面落地后：
 
-- 普通构建：成功；
-- `ctest --test-dir build --output-on-failure`：11/11 通过；
+- 普通构建（`build`）：成功；
+- `ctest --test-dir build --output-on-failure`：13/13 通过；
 - ASan 构建（`build-asan-tests`）：成功；
-- `ctest --test-dir build-asan-tests --output-on-failure`：11/11 通过。
+- `ctest --test-dir build-asan-tests --output-on-failure`：13/13 通过；
+- `MQ_BUILD_ROS2_BRIDGE=ON` 构建（`build-ros2`）：成功；
+- `ctest --test-dir build-ros2 --output-on-failure`：13/13 通过；
+- 真实 broker + ROS2 Humble 手工 smoke test：
+  - ROS2 → MQ：`/bridge/task` 的 `std_msgs/msg/String` 进入 MQ 队列，
+    `BridgeEnvelope` 中的 CDR 内容为 `hello from ros2`；
+  - MQ → ROS2：注入 envelope 后 `/chatter` 收到 `hello from mq`；
+  - retained：持久化文件生成，bridge 重启后回放成功。
 
 ---
 
@@ -1090,6 +1211,45 @@ Channel::xxx()
 9. 持久化消息 ACK 时只把 `valid` 改成 `"0"`，不重新序列化整条消息；
 10. 线程池任务持有必要的 `shared_ptr`，回调持有 `weak_ptr<Channel>`。
 
+### 11.4 bridge 数据面链路
+
+```text
+mq_bridge --check-config
+  ├─ BridgeConfigLoader::loadFromFile()
+  │    ├─ protobuf TextFormat 解析
+  │    ├─ applyDefaults()
+  │    └─ validate()
+  └─ printSummary() / QosMapper::toMq()
+
+mq_bridge --run（打开 MQ_BUILD_ROS2_BRIDGE 时）
+  ├─ rclcpp::init()
+  ├─ BridgeRuntime::start()
+  │    ├─ MqClientAdapter::connect()
+  │    ├─ declareTopology(): exchange / queue / binding
+  │    ├─ RetainedStore::load()
+  │    ├─ createRos2Bridge(): generic pub/sub
+  │    ├─ replayRetained()
+  │    └─ consume() for MQ_TO_ROS2 topics
+  ├─ rclcpp::spin(node)
+  └─ BridgeRuntime::stop()
+       ├─ 停止串行任务线程
+       ├─ MqClientAdapter::stop()：basicCancel + 归还 wait-ack
+       └─ 销毁 ROS2 node
+```
+
+各模块的职责边界：
+
+- `BridgeRuntime` 只做编排，不解析 CDR，也不直接操作 muduo；
+- `EnvelopeCodec` 只处理 `BridgeEnvelope`，不解析 CDR；
+- `QosMapper` 只做近似参数映射，不改变 broker 队列语义；
+- `RetainedStore` 只保存最近状态，不参与 ACK/重投；
+- `MqClientAdapter` 只封装现有 MQ 客户端，不包含 ROS2 类型；
+- `Ros2Bridge` 只处理 ROS2 序列化消息，不直接访问 broker。
+
+MQ → ROS2 与 ROS2 → MQ 都由 `TaskQueue` 串行执行。回调线程只负责复制
+消息并入队，因此 `basicPublish`、`basicAck`、`basicReject` 这些可能等待
+broker 响应的同步请求不会卡住 ROS2 executor。
+
 ---
 
 ## 12. 已知限制
@@ -1115,7 +1275,7 @@ Channel::xxx()
 
 - **没有 per-subscriber 历史回放**：
   队列是工作队列，消费即出队；新订阅者不会获得历史消息副本。
-  ROS2 latched/retained 语义必须在未来的 bridge 中用 retained store 实现。
+  ROS2 latched/retained 语义由 bridge 的 retained store 实现，不改变队列语义。
 - **`x-max-length` 只约束就绪消息**：
   已被取走但未 ACK 的消息不计入上限；消费者长期不 ACK 时总量仍可能超限。
 - **`delivery_count` 不持久化**：
@@ -1168,6 +1328,32 @@ Channel::xxx()
 - **`.mqd` 追加写 + 周期性 GC**：
   文件会先增长，再在阈值触发时重写；写放大和磁盘占用需要根据业务评估。
 
+### 12.6 ROS2 bridge
+
+- **没有自动重连 / 连接超时**：
+  broker 断开后 `mq_bridge` 不会重新连接、重新声明拓扑或恢复 consumer；
+  当前需要重启 bridge。客户端 `Connection` 构造函数没有连接超时，broker
+  不可达时启动可能阻塞，因此应先启动 broker。连接对象也没有健康检查接口。
+- **ROS2 → MQ 没有 Publisher Confirm**：
+  发布请求失败会记录日志，但无法证明消息一定没有进入队列；
+  因此该方向是 at-most-once。
+- **背压有限**：
+  串行任务队列上限 4096；满时 MQ → ROS2 会 requeue，ROS2 → MQ 只能丢弃。
+  MQ 侧 prefetch 使用 `depth` 近似，但多 topic 时总在途量仍可能较大。
+- **双向配置可能形成回环**：
+  如果 ROS2 → MQ 的发布目标队列又被同一 bridge 的 MQ → ROS2 消费，消息会在
+  两个 topic 之间循环；BIDIRECTIONAL 使用同一个 topic 时也会回环。示例配置
+  因此为两个方向使用不同的 routing key 和队列。
+- **没有 bridge 指标**：
+  只有日志，没有转发计数、延迟、丢弃/重投计数。
+- **QoS 只是子集**：
+  只映射 reliability/durability/history depth；不会自动给已有队列补
+  `x-ack-timeout-ms` / `x-max-delivery-count`，需要用户在 `queue_args` 中显式配置。
+- **自动化集成测试缺失**：
+  核心测试不启动 ROS2；真实链路目前靠手工 smoke test。
+- **bridge 目标使用 C++17**：
+  rclcpp 要求更高标准；broker 本身仍保持 C++11。
+
 ---
 
 ## 13. 路线图与 ROS2 Bridge MVP
@@ -1195,10 +1381,12 @@ Channel::xxx()
 - 队列参数持久化；
 - 对应单元测试。
 
-### 13.2 第 3 步：ROS2 Bridge MVP（规划中，未实现）
+### 13.2 第 3 步：ROS2 Bridge MVP（双向数据面已实现）
 
-> 本节是设计方案，不是当前代码。当前仓库没有 `mq_bridge` 可执行文件，
-> 也没有 `MQ_BUILD_ROS2_BRIDGE` 选项，且 broker 不依赖任何 ROS2 库。
+> 当前仓库已有独立 `mq_bridge`、`MQ_BUILD_ROS2_BRIDGE` 选项和完整的
+> MQ ↔ ROS2 双向转发；broker 仍不依赖任何 ROS2 库。MVP 的数据面已经
+> 可以运行，但自动重连、Publisher Confirm、指标和自动化 ROS2 集成测试
+> 仍属于后续稳定化工作。
 
 #### 13.2.1 设计目标
 
@@ -1239,35 +1427,42 @@ MVP 不包含：
 
 - broker 不引入 `rclcpp`，不解析 CDR；
 - bridge 使用现有客户端库连接 broker；
-- CDR 二进制放在 `Message.body` 中，broker 只按字节透传；
+- CDR 二进制放在 `Message.body` 中，broker 只按字节透传；协议字段因此使用
+  protobuf `bytes`，避免 UTF-8 校验拒绝二进制 envelope；
 - retained store 属于 bridge，不改变 broker 的队列语义；
 - 通过 `MQ_BUILD_ROS2_BRIDGE=ON` 条件编译，默认关闭，保证不装 ROS2 也能构建 broker。
 
 #### 13.2.4 `BridgeEnvelope`
 
-bridge 需要一个稳定的消息封装，建议放在 `bridge/proto/bridge_envelope.proto`，
-由 bridge 自己生成和解析，不进入 broker 的协议依赖。
+bridge 需要一个稳定的消息封装。实际文件在
+[`proto/bridge_envelope.proto`](proto/bridge_envelope.proto)，由 bridge 自己生成和解析，
+不进入 broker 的协议依赖。
 
-规划字段：
+实际字段：
 
 ```proto
 syntax = "proto3";
 package mq.bridge;
 
+import "bridge_config.proto";
+
 message BridgeEnvelope {
-    uint32 version = 1;            // envelope 版本，MVP 从 1 开始
-    string topic = 2;              // ROS2 topic 名
-    string ros_type = 3;           // 例如 sensor_msgs/msg/Imu
-    uint64 stamp_ns = 4;           // bridge 接收/生成时间
-    bytes cdr = 5;                 // ROS2 序列化后的 CDR 字节
-    string source = 6;             // 来源标识，便于排查
-    string correlation_id = 7;     // 关联 id / 去重键
-    uint32 reliability = 8;        // 0=best_effort, 1=reliable
-    uint32 durability = 9;         // 0=volatile, 1=transient_local
-    uint32 depth = 10;             // 建议缓冲深度
+    uint32 version = 1;              // 从 1 开始
+    string topic = 2;                // ROS2 topic 名
+    string ros_type = 3;             // 例如 sensor_msgs/msg/Imu
+    uint64 stamp_ns = 4;             // bridge 接收/生成时间
+    bytes cdr = 5;                   // ROS2 序列化后的 CDR 字节
+    string source = 6;               // 来源标识
+    string correlation_id = 7;       // 关联 id / 去重键
+    BridgeReliability reliability = 8;
+    BridgeDurability durability = 9;
+    uint32 depth = 10;               // 建议的 ROS2 history depth
     map<string, string> headers = 11;
 }
 ```
+
+`mq::bridge::EnvelopeCodec` 负责 `encode/decode/validate`：version 为 0 时
+自动填入当前版本，未来版本会被拒绝；cdr 字节不被 bridge 修改。
 
 说明：
 
@@ -1284,15 +1479,20 @@ message BridgeEnvelope {
 - 如果为每个新订阅者回放历史消息，会改变现有队列语义；
 - retained 需求只属于 bridge 的 ROS2 侧。
 
-MVP 设计：
+实际实现：
 
+- 类：`mq::bridge::RetainedStore`，线程安全；
 - key：`topic`（后续可扩展为 `topic + key`）；
-- value：最近一条 `BridgeEnvelope`；
-- 每个 topic 默认只保留 1 条；
-- 支持 TTL / 最大条目数；
-- 内存为主，可选 SQLite/文件持久化；
-- bridge 启动时恢复 retained 状态；
-- ROS2 侧使用 `transient_local` publisher，让晚加入的订阅者拿到最近状态；
+- value：序列化后的 `BridgeEnvelope` 和 `updated_ms`；
+- 每个 topic 默认只保留 1 条，可配置容量；
+- 支持 TTL；
+- 内存为主，配置 `persist_path` 时用 protobuf 文件原子写盘；
+- `load()` 在 bridge 启动时恢复 retained 状态；
+- `BridgeRuntime::start()` 在 MQ 消费开始前调用 `replayRetained()`，把最新
+  envelope 的 CDR 发布到对应 ROS2 publisher；
+- ROS2 侧是配置的 durability：`TRANSIENT_LOCAL` 时 publisher 自己也会缓存
+  样本，晚加入的 transient-local 订阅者可以拿到；`VOLATILE` 时只有 bridge
+  启动回放，不能保证 bridge 启动后才加入的订阅者收到历史样本；
 - retained store 不参与任务队列的 ACK/重投语义。
 
 典型场景：
@@ -1309,12 +1509,12 @@ ROS2/DDS QoS 策略很多，MVP 只映射最常用的三项：reliability、dura
 
 | ROS2 QoS | MQ 侧近似 | 说明 |
 | --- | --- | --- |
-| `RELIABLE` | 手动 ACK + `x-ack-timeout-ms` + `x-max-delivery-count` | 允许重投，保证至少一次 |
-| `BEST_EFFORT` | `auto_ack=true` | 允许丢失，不重投 |
-| `TRANSIENT_LOCAL` | retained store | 晚加入订阅者获取最近状态 |
-| `VOLATILE` | 不启用 retained | 只接收在线期间的消息 |
-| `depth=N` | `x-max-length` / bridge 缓冲 | 不是严格的 DDS history，只是近似 |
-| `deadline` | 不支持 | MVP 只记录配置 |
+| `RELIABLE` | 手动 ACK；队列/交换机 durable=true | 允许重投；`x-ack-timeout-ms` / `x-max-delivery-count` 需在 `queue_args` 显式配置 |
+| `BEST_EFFORT` | `auto_ack=true`；队列/交换机 durable=false | 允许丢失，不重投 |
+| `TRANSIENT_LOCAL` | retained store（store 启用时）+ transient_local publisher | bridge 启动时回放；晚加入的 transient-local 订阅者可拿到 DDS 缓存 |
+| `VOLATILE` | 默认不启用 retained | 只接收在线期间的消息；显式 `retained: true` 可额外使用 bridge 缓存 |
+| `depth=N` | ROS2 history depth；best-effort 可补 `x-max-length` | 不是严格的 DDS history，reliable 任务队列不自动截断 |
+| `deadline` | 不支持 | 需要 DDS 层能力 |
 | `lifespan` | 不支持 | 后续可用消息 TTL 近似 |
 | `liveliness` | 不支持 | 需要 DDS 层能力 |
 
@@ -1335,7 +1535,8 @@ ROS2 订阅者（晚加入）
         │ transient_local / retained
         │
    mq_bridge
-        │  consume + auto_ack
+        │  BEST_EFFORT: consume + auto_ack
+        │  RELIABLE: consume + 手动 ACK
         ▼
 MQ queue: telemetry.imu
   x-max-length = 1
@@ -1346,8 +1547,10 @@ MQ queue: telemetry.imu
 
 - 只关心最新值；
 - 旧值可以被 `x-max-length` 淘汰；
-- bridge 发布成功后 ACK；
-- retained store 为晚加入的 ROS2 订阅者提供最近状态。
+- BEST_EFFORT 由 broker auto_ack，发布失败无法重投；需要至少一次时改用
+  RELIABLE，bridge 会在 ROS2 publish 成功后才 ACK；
+- retained store 为 bridge 启动回放提供最近状态，`TRANSIENT_LOCAL` 还能让
+  晚加入的同类订阅者拿到 DDS 缓存。
 
 **任务（ROS2 → MQ）**
 
@@ -1375,150 +1578,224 @@ MQ exchange/queue: task.queue
 - 达到最大次数进入死信；
 - 不使用 retained store。
 
-#### 13.2.8 配置草案
+#### 13.2.8 配置
 
-MVP 建议使用简单的 key=value 或 JSON 配置，避免为了配置再引入重量级依赖。
-如果使用 YAML，需要显式加入 `yaml-cpp` 并在 CMake 中声明。
+实际配置使用 protobuf text format，由
+[`proto/bridge_config.proto`](proto/bridge_config.proto) 定义，
+[`BridgeConfigLoader`](src/bridge/bridge_config.hpp) 负责解析、补齐默认值和语义校验。
+这样不需要为了配置再引入 YAML/JSON 依赖。
 
-示例（仅示意）：
-
-```yaml
-bridge:
-  node_name: mq_bridge
-  mq_host: 127.0.0.1
-  mq_port: 8085
-  retained_store:
-    enabled: true
-    capacity_per_topic: 1
-    persist_path: ./data/bridge-retained.db
-  topics:
-    - name: /imu/data
-      ros_type: sensor_msgs/msg/Imu
-      direction: mq_to_ros2
-      queue: telemetry.imu
-      exchange: telemetry
-      routing_key: imu
-      reliability: best_effort
-      durability: volatile
-      retained: true
-    - name: /task
-      ros_type: example_interfaces/msg/String
-      direction: ros2_to_mq
-      exchange: tasks
-      routing_key: task
-      queue: task.queue
-      reliability: reliable
-      durability: transient_local
-      depth: 10
-```
-
-#### 13.2.9 模块划分（规划）
+实际示例（节选，完整文件见
+[`config/bridge.conf.example`](config/bridge.conf.example)）：
 
 ```text
-src/bridge/
-├── main.cc                  # 进程入口、配置加载、生命周期
-├── bridge_config.hpp        # 配置解析
-├── envelope_codec.hpp       # BridgeEnvelope 序列化/反序列化
-├── qos_mapper.hpp           # ROS2 QoS <-> MQ 参数
-├── retained_store.hpp       # 最近状态缓存
-├── mq_client_adapter.hpp    # 复用现有客户端库
-├── ros2_publisher.hpp       # MQ -> ROS2
-├── ros2_subscriber.hpp      # ROS2 -> MQ
-└── metrics.hpp              # 可选：计数/日志
+node_name: "mq_bridge"
+mq_host: "127.0.0.1"
+mq_port: 8085
+
+retained_store {
+    enabled: true
+    capacity_per_topic: 1
+    ttl_sec: 0
+    persist_path: "./data/bridge-retained.db"
+}
+
+topics {
+    name: "/chatter"
+    ros_type: "std_msgs/msg/String"
+    direction: MQ_TO_ROS2
+    exchange: "exchange1"
+    exchange_type: EXCHANGE_TOPIC
+    routing_key: "news.music.pop"
+    queue: "queue2"
+    reliability: RELIABLE
+    durability: VOLATILE
+    depth: 10
+    retained: true
+}
 ```
 
-CMake 规划：
+校验规则包括：
+
+- `node_name`、`mq_host`、`mq_port` 合法；
+- `MQ_TO_ROS2` 必须有 `queue`，`ROS2_TO_MQ` 必须有 `exchange`；
+- topic 名不能重复；
+- `retained` 只能用于包含 MQ → ROS2 的方向；
+- `exchange_type` 只能是 `EXCHANGE_DIRECT` / `EXCHANGE_FANOUT` /
+  `EXCHANGE_TOPIC`，未填时默认 `EXCHANGE_TOPIC`；
+- 同一个 exchange 被多个 topic 引用时，`exchange_type` 必须一致；
+- reliability、durability、depth、exchange_type 会补默认值
+  （RELIABLE / VOLATILE / 10 / TOPIC）。
+
+#### 13.2.9 模块划分
+
+```text
+proto/
+├── bridge_config.proto        # 配置、方向、QoS、exchange_type、retained store
+└── bridge_envelope.proto      # BridgeEnvelope + retained 持久化格式
+
+src/bridge/
+├── main.cc                    # --check-config / --run 生命周期
+├── bridge_config.hpp/.cc      # protobuf text 配置解析、默认值、校验
+├── bridge_runtime.hpp/.cc     # 拓扑声明、双向转发、retained 回放、任务队列
+├── envelope_codec.hpp/.cc     # BridgeEnvelope 编解码/版本校验
+├── qos_mapper.hpp/.cc         # ROS2 QoS <-> MQ 近似参数
+├── retained_store.hpp/.cc     # 线程安全最近状态缓存 + 可选文件持久化
+├── mq_client_adapter.hpp/.cc  # 复用现有 MQ 客户端库
+├── ros2_bridge.hpp/.cc        # 可选 rclcpp generic pub/sub 适配器
+└── ...
+
+config/
+└── bridge.conf.example        # 可直接 --check-config 的示例
+```
+
+CMake 实际结构：
 
 ```cmake
-option(MQ_BUILD_ROS2_BRIDGE "Build the ROS2 bridge" OFF)
+option(MQ_BUILD_ROS2_BRIDGE "Build mq_bridge with ROS2/rclcpp support" OFF)
+
+protobuf_generate_cpp(BRIDGE_PROTO_SRCS BRIDGE_PROTO_HDRS
+    proto/bridge_config.proto
+    proto/bridge_envelope.proto)
+
+add_library(mq_bridge_core STATIC
+    ${BRIDGE_PROTO_SRCS}
+    src/bridge/bridge_config.cc
+    src/bridge/bridge_runtime.cc
+    src/bridge/envelope_codec.cc
+    src/bridge/mq_client_adapter.cc
+    src/bridge/qos_mapper.cc
+    src/bridge/retained_store.cc
+    src/bridge/ros2_bridge.cc
+)
+target_link_libraries(mq_bridge_core PUBLIC mq_core)
 
 if(MQ_BUILD_ROS2_BRIDGE)
     find_package(rclcpp REQUIRED)
-    find_package(rclcpp_serialization REQUIRED)
-    # 具体依赖按 ROS2 发行版补充
-
-    add_executable(mq_bridge
-        src/bridge/main.cc
-        # ...
-    )
-    target_link_libraries(mq_bridge PRIVATE
-        mq_core
-        rclcpp::rclcpp
-        # ...
-    )
+    target_compile_features(mq_bridge_core PUBLIC cxx_std_17)
+    target_compile_definitions(mq_bridge_core PUBLIC MQ_WITH_ROS2=1)
+    target_link_libraries(mq_bridge_core PUBLIC rclcpp::rclcpp)
 endif()
+
+add_executable(mq_bridge src/bridge/main.cc)
+target_link_libraries(mq_bridge PRIVATE mq_bridge_core)
 ```
 
-再次强调：以上代码和选项目前**不存在**，只是第三步的落点。
+说明：
 
-#### 13.2.10 消息流程
+- `mq_bridge_core` 始终构建，因此不装 ROS2 也能校验配置和跑核心测试；
+- `MQ_BUILD_ROS2_BRIDGE=OFF` 时 `ros2_bridge.cc` 编译为明确报错的 stub；
+- 只有打开选项时 bridge 目标才使用 C++17 并链接 `rclcpp`；
+- broker 的 `mq_core` 仍只依赖 C++11/muduo/protobuf/SQLite。
+
+#### 13.2.10 消息流程（已实现）
 
 **MQ → ROS2**
 
 ```text
-1. bridge 启动，声明 MQ exchange/queue/binding，读取 retained store
-2. bridge 以手动/自动 ACK 模式订阅队列
-3. 收到消息：
+1. BridgeRuntime::start()
+   a. MqClientAdapter::connect()
+   b. 按 topic 配置声明 exchange / queue / binding
+   c. RetainedStore::load()
+   d. 创建 ROS2 generic publisher/subscriber
+   e. replayRetained()
+   f. 对 MQ_TO_ROS2 topic 调用 consume()
+2. MQ 回调只把 MqDelivery 投递到 TaskQueue
+3. 任务线程：
    a. 解析 BridgeEnvelope
-   b. 校验 version / ros_type / topic
-   c. 反序列化 CDR 为 ROS2 消息
-   d. 更新 retained store（如果启用）
-   e. 通过 rclcpp publisher 发布，QoS 按映射配置
-   f. 发布成功 -> ACK；可靠模式下失败 -> Reject/requeue
-4. ROS2 晚加入订阅者通过 transient_local 收到 retained 状态
+   b. 校验 version / topic / ros_type
+   c. 把 envelope.cdr 原样交给 generic publisher
+   d. 如果 retained 启用，保存原始 envelope 字节
+   e. publish 成功 -> ACK；失败 -> reject(requeue=true)
+   f. envelope 无法解析或 topic/type 不匹配 -> reject(requeue=false)
+4. bridge 启动时 retained 回放发生在消费开始前；TRANSIENT_LOCAL publisher
+   还会为晚加入的 transient-local 订阅者保留最新样本
 ```
+
+注意：bridge 不反序列化 CDR，也不理解 ROS2 消息字段；它只校验 envelope
+和配置的 topic/type 是否匹配，然后透传序列化字节。
 
 **ROS2 → MQ**
 
 ```text
-1. bridge 创建 ROS2 subscriber，按配置的 QoS 订阅
-2. 收到 ROS2 消息：
-   a. 序列化为 CDR
-   b. 封装 BridgeEnvelope
-   c. 通过 MQ 客户端 basicPublish 到 exchange
+1. ROS2 subscriber 回调只复制 SerializedMessage 的字节并投递到 TaskQueue
+2. 任务线程：
+   a. 生成 BridgeEnvelope（cdr、topic、ros_type、stamp、source、
+      correlation_id、QoS 快照）
+   b. EnvelopeCodec::encode()
+   c. 构造 BasicProperties（id、delivery_mode、routing_key）并调用
+      MqClientAdapter::publish()
 3. MQ 消费端手动 ACK/Reject
-4. 失败任务按 x-ack-timeout-ms / x-max-delivery-count / DLX 处理
+4. 失败任务按队列的 x-ack-timeout-ms / x-max-delivery-count / DLX 处理
 ```
+
+当前客户端没有 Publisher Confirm，因此第 2.c 步只能确认 publish 请求得到
+broker 的普通响应，不能确认消息已经持久化或路由到队列。
 
 #### 13.2.11 里程碑
 
-| 阶段 | 内容 | 验收 |
+| 阶段 | 内容 | 状态 |
 | --- | --- | --- |
-| 3A | MQ → ROS2 单 topic、`std_msgs/String`、envelope、retained store、QoS 映射 | 发布到 MQ 后 ROS2 能收到；晚加入订阅者能拿到最近状态 |
-| 3B | ROS2 → MQ 单 topic、CDR、durable task queue、手动 ACK | 任务写入 MQ；消费失败可重投/死信 |
-| 3C | 多 topic 配置、重连、指标、retained 持久化、集成测试 | 配置多个 topic 稳定运行；bridge 重启后可恢复 |
+| 3.0 | 独立进程、配置校验、envelope、QoS 映射、retained store、MQ/ROS2 适配器框架 | **已完成** |
+| 3A | MQ → ROS2 单 topic、envelope、retained store、QoS 映射、手动 ACK/Reject | **已完成**：真实 broker + `std_msgs/msg/String` 手工 smoke test |
+| 3B | ROS2 → MQ 单 topic、CDR、durable task queue、BridgeEnvelope 编码 | **已完成**：真实 ROS2 publisher + MQ consumer 手工 smoke test |
+| 3C | 多 topic 配置、拓扑声明、串行任务队列、retained 持久化与启动回放 | **已完成**：多 topic 配置结构和启动回放已接入 |
+| 3D | 自动重连、指标、Publisher Confirm、自动化 ROS2 集成测试 | **未完成** |
 
 #### 13.2.12 验收标准
 
+MVP 已满足：
+
 1. 不打开 `MQ_BUILD_ROS2_BRIDGE` 时，broker 构建和测试完全不受影响；
 2. broker 源码不包含 `rclcpp` / DDS 头文件；
-3. MQ → ROS2 的 CDR 字节不被 broker 修改；
-4. 任务队列使用手动 ACK，不静默丢弃；
-5. 遥测队列可以通过 `x-max-length` 丢弃旧状态；
-6. 晚加入的 ROS2 订阅者能获得 retained 最近状态；
-7. bridge 断开/重连后，MQ 侧消息不丢失（在持久化配置下）；
-8. 有单元测试覆盖 envelope 编解码、QoS 映射、retained store 和关键流程。
+3. `mq_bridge --config ... --check-config` 能拒绝非法配置并打印计划；
+4. envelope、QoS 映射、retained store、exchange_type 有单元测试；
+5. MQ → ROS2 的 CDR 字节不被修改，`std_msgs/msg/String` 手工 smoke test 通过；
+6. ROS2 → MQ 能从真实 ROS2 publisher 收到消息，并在 MQ 队列中看到完整
+   `BridgeEnvelope`；
+7. reliable MQ 消费在 ROS2 publish 成功后才 ACK，失败走 Reject/requeue；
+8. retained store 可持久化，bridge 重启后 `replayRetained()` 能重新发布最近状态。
+
+仍需稳定化：
+
+1. broker 断开后自动重连并恢复 consumer/拓扑；
+2. bridge 指标（转发、重投、丢弃、延迟）；
+3. Publisher Confirm / mandatory 返回；
+4. 自动化真实 ROS2 集成测试和长时间压力测试。
 
 #### 13.2.13 测试计划
 
-- `envelope_codec_test`：序列化/反序列化、版本兼容、空 CDR；
-- `qos_mapper_test`：reliability/durability/depth 映射；
-- `retained_store_test`：覆盖写、容量、TTL、重启恢复；
-- `bridge_config_test`：非法配置、缺省值；
-- mock MQ / mock ROS2 的集成测试；
-- 手工 demo：100Hz IMU + 图像大包，观察延迟和丢包。
+已实现：
+
+- `mq_bridge_coretest`：envelope 编解码/版本兼容、QoS 映射、retained store
+  容量/TTL/重启恢复、配置解析/默认值/非法配置、exchange_type 冲突、
+  BridgeRuntime 启动前校验失败路径；
+- `mq_hosttest`：额外覆盖含 NUL/非 UTF-8 字节的二进制消息体；
+- `mq_bridge_config_check`：示例配置通过 CLI `--check-config`；
+- 手工 smoke test（真实 broker + ROS2 Humble）：
+  - MQ → ROS2：注入 `BridgeEnvelope`，`ros2 topic echo` 收到 `std_msgs/msg/String`；
+  - ROS2 → MQ：`ros2 topic pub` 后 MQ 队列收到完整 envelope，CDR 内容一致；
+  - retained：持久化文件生成，重启 bridge 后回放成功。
+
+待补：
+
+- 真实 broker + ROS2 的自动化集成测试；
+- 拓扑声明、ACK/Reject、断线重连测试；
+- 100Hz IMU + 图像大包 demo，观察延迟和丢包。
 
 #### 13.2.14 风险与对策
 
 | 风险 | 对策 |
 | --- | --- |
-| CDR 对齐/字节序 | 使用 `rclcpp::Serialization`，不要在 bridge 手写 CDR 解析 |
+| CDR 对齐/字节序 | 使用 ROS2 已经序列化好的 `SerializedMessage`，不在 bridge 手写 CDR 解析 |
 | QoS 语义无法完全映射 | 明确“近似映射”，在配置和文档中标注 |
 | retained store 内存增长 | 每 topic 限制条数 + TTL + 监控 |
-| 回调线程与 ROS2 executor 竞争 | 明确线程模型：MQ 回调只入队，ROS2 发布在 executor 线程 |
+| 回调线程与 ROS2 executor 竞争 | MQ 回调和 ROS2 executor 都只复制消息并投递到串行任务队列；publish/ACK 不在回调线程执行 |
+| task queue 无界增长 | 上限 4096；MQ → ROS2 满时 requeue，ROS2 → MQ 记录后丢弃 |
 | bridge 重启丢状态 | retained store 可选持久化；MQ 消息依赖 broker 持久化 |
 | 重复投递 | 使用 `correlation_id` + 消费端幂等 |
-| 大包阻塞 | 单独回调线程/队列，必要时限流 |
+| 大包阻塞 | 串行任务队列会顺序处理大包；后续可拆分队列/限流 |
+| broker 断线 | 当前需要重启 bridge；后续补自动重连和拓扑恢复 |
 
 #### 13.2.15 为什么采用独立进程
 
@@ -1532,15 +1809,16 @@ endif()
 
 在 ROS2 Bridge MVP 之后，可以按优先级考虑：
 
-1. **Publisher Confirm**：让发布端知道 broker 是否成功落盘/入队；
-2. **basicNack(multiple) / 批量 ACK**：降低高频消费的协议开销；
-3. **消息 TTL / 延迟队列**：支持超时取消、延迟重试；
-4. **监控指标**：队列深度、消费者数、wait-ack 数、超时数、死信数；
-5. **更好的持久化重投计数**：把 `delivery_count` 写入持久化记录；
-6. **死信环路检测**：限制最大跳数；
-7. **客户端重连与自动恢复订阅**；
-8. **TLS / 鉴权 / 权限控制**；
-9. **多 VirtualHost / 集群 / 副本**。
+1. **bridge 自动重连**：broker 断开后重新连接、恢复 topology 和 consumer；
+2. **bridge 集成测试**：真实 broker + ROS2 双向链路、retained 回放、失败重投；
+3. **Publisher Confirm**：让发布端知道 broker 是否成功落盘/入队；
+4. **basicNack(multiple) / 批量 ACK**：降低高频消费的协议开销；
+5. **消息 TTL / 延迟队列**：支持超时取消、延迟重试；
+6. **监控指标**：队列深度、消费者数、wait-ack 数、超时数、死信数、bridge 转发数；
+7. **更好的持久化重投计数**：把 `delivery_count` 写入持久化记录；
+8. **死信环路检测**：限制最大跳数；
+9. **TLS / 鉴权 / 权限控制**；
+10. **多 VirtualHost / 集群 / 副本**。
 
 ---
 
@@ -1556,11 +1834,15 @@ endif()
 - 用 SQLite + `.mqd` 解释元数据和消息体的持久化；
 - 用 `PROJECT.md` 中的规划说明如何在不污染 broker 的前提下接入 ROS2。
 
-当前第 1/2 步已经形成可运行、可测试的闭环。
-第 3 步 ROS2 Bridge MVP 仍是规划；实现时应坚持两个边界：
+当前第 1/2 步已经形成可运行、可测试的闭环；第 3 步的 ROS2 Bridge
+双向数据面也已接通，可以用真实 broker + ROS2 做手工验证。
+继续演进时应坚持两个边界：
 
 1. **broker 不依赖 ROS2**；
 2. **retained state 属于 bridge，不改变队列的工作队列语义**。
+
+接下来最有价值的工作不是继续堆功能，而是把 bridge 的重连、指标和集成测试
+补齐，让它在断线、背压和长时间运行下也可观测、可恢复。
 
 ---
 
@@ -1579,6 +1861,12 @@ cmake -S . -B build-asan -DMQ_ENABLE_ASAN=ON
 cmake --build build-asan -j
 ctest --test-dir build-asan --output-on-failure
 
+# ROS2 bridge 构建（Humble）
+source /opt/ros/humble/setup.bash
+cmake -S . -B build-ros2 -DMQ_BUILD_ROS2_BRIDGE=ON
+cmake --build build-ros2 -j
+ctest --test-dir build-ros2 --output-on-failure
+
 # 启动 broker
 ./build/bin/mqserver ./data/ 8085
 
@@ -1587,6 +1875,10 @@ ctest --test-dir build-asan --output-on-failure
 
 # 发布
 ./build/bin/publish_client
+
+# bridge 配置检查 / 运行
+./build/bin/mq_bridge --config config/bridge.conf.example --check-config
+./build-ros2/bin/mq_bridge --config config/bridge.conf.example --run
 ```
 
 ## 附录 B：术语表

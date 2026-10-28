@@ -1,0 +1,67 @@
+# mq_bridge 配置示例（protobuf text format）。
+#
+# 这个文件只被 mq_bridge 读取；broker 不需要它，也不依赖 ROS2。
+# 使用方式：
+#   ./build/bin/mq_bridge --config config/bridge.conf.example --check-config
+#   ./build-ros2/bin/mq_bridge --config config/bridge.conf.example --run
+#
+# --run 会连接 mq_host:mq_port，声明下列 exchange/queue/binding，并启动
+# MQ <-> ROS2 双向数据面。需要先用 -DMQ_BUILD_ROS2_BRIDGE=ON 构建。
+
+node_name: "mq_bridge"
+mq_host: "127.0.0.1"
+mq_port: 8085
+
+retained_store {
+    enabled: true
+    capacity_per_topic: 1
+    ttl_sec: 0
+    # 为空表示只保存在内存；需要恢复时指向一个可写文件。
+    persist_path: "./data/bridge-retained.db"
+}
+
+# MQ -> ROS2：消费 queue2，把 BridgeEnvelope.cdr 发布到 /chatter。
+#
+# reliability=RELIABLE 会让 MQ 消费使用手动 ACK；bridge 只有在 ROS2 publish
+# 成功后才 ACK，失败则 reject(requeue=true)。durability=VOLATILE 表示 ROS2
+# 侧不保留 DDS 历史；retained=true 额外把最近一条放入 bridge retained store，
+# 在 bridge 启动时回放。若需要 bridge 启动后才加入的订阅者也收到样本，应把
+# durability 改为 TRANSIENT_LOCAL。
+topics {
+    name: "/chatter"
+    ros_type: "std_msgs/msg/String"
+    direction: MQ_TO_ROS2
+    exchange: "exchange1"
+    exchange_type: EXCHANGE_TOPIC
+    routing_key: "news.music.pop"
+    queue: "queue2"
+    reliability: RELIABLE
+    durability: VOLATILE
+    depth: 10
+    retained: true
+}
+
+# ROS2 -> MQ：订阅 /bridge/task，把 CDR 封装成 BridgeEnvelope 后发布到
+# exchange1，routing_key=bridge.task。queue 非空时 bridge 会一并声明并绑定
+# bridge_task_queue，保证消息有确定的落点；如果 queue 留空，则只发布到
+# exchange，依赖已有绑定。
+#
+# 注意不要和上面的 MQ -> ROS2 复用同一个队列，否则 bridge 会把自己刚发布的
+# 任务又消费回来。
+#
+# 发布属性使用 delivery_mode=DURABLE（RELIABLE 映射结果），但当前客户端
+# 没有 Publisher Confirm，所以“成功”只表示 broker 收到了发布请求，不保证
+# 已持久化。
+topics {
+    name: "/bridge/task"
+    ros_type: "std_msgs/msg/String"
+    direction: ROS2_TO_MQ
+    exchange: "exchange1"
+    exchange_type: EXCHANGE_TOPIC
+    routing_key: "bridge.task"
+    queue: "bridge_task_queue"
+    reliability: RELIABLE
+    durability: VOLATILE
+    depth: 10
+    retained: false
+}

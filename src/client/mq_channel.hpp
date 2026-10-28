@@ -154,7 +154,10 @@ namespace mq
         // 发布消息。
         // 当前只等待 broker 的“路由处理完成”响应，不提供 Publisher Confirm：
         // 服务端持久化失败等错误不会通过返回值区分。
-        void basicPublish(
+        // 返回 broker 的普通发布响应是否成功。
+        // 注意：这仍然不是 Publisher Confirm，只表示 broker 接受了请求；
+        // 是否路由到队列、是否持久化不在这个返回值里。
+        bool basicPublish(
             const std::string &ename,
             const BasicProperties *bp,
             const std::string &body)
@@ -173,8 +176,7 @@ namespace mq
                 req.mutable_properties()->set_delivery_count(bp->delivery_count());
             }
             _codec->send(_conn, req);
-            waitResponseOk(rid, "发布消息");
-            return;
+            return waitResponseOk(rid, "发布消息");
         }
 
         void basicAck(const std::string &msgid)

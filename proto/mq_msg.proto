@@ -29,7 +29,7 @@ message BasicProperties{
 message Message {
     message Payload {
         BasicProperties properties = 1; // 消息属性
-        string body = 2;                // 消息体；对新 bridge 来说可以是二进制 envelope
+        bytes body = 2;                 // 消息体；对新 bridge 来说可以是二进制 envelope
         string valid = 3;               // "1"=有效；"0"=已 ACK/丢弃，等待 GC
     };
     Payload payload = 1; // 有效载荷

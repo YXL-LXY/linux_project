@@ -83,6 +83,22 @@ TEST_F(HostTest, init_test) {
 }
 
 
+TEST_F(HostTest, preserves_binary_body) {
+    // bridge 会把 BridgeEnvelope（含 CDR 字节）放进消息体；protobuf 的 body
+    // 字段必须是 bytes，不能是 string，否则含 NUL/非 UTF-8 的消息会被拒绝。
+    google::protobuf::Map<std::string, std::string> empty_map;
+    ASSERT_TRUE(_host->declareQueue("queue_binary", true, false, false, empty_map));
+
+    const std::string binary_body("\x00\x01\xff\x7fhello", 9);
+    ASSERT_TRUE(_host->basicPublish("queue_binary", nullptr, binary_body));
+
+    mq::MessagePtr msg = _host->basicConsume("queue_binary");
+    ASSERT_NE(msg.get(), nullptr);
+    EXPECT_EQ(msg->payload().body(), binary_body);
+    _host->basicAck("queue_binary", msg->payload().properties().id());
+    _host->deleteQueue("queue_binary");
+}
+
 TEST_F(HostTest, max_length) {
     google::protobuf::Map<std::string, std::string> args;
     args["x-max-length"] = "2";

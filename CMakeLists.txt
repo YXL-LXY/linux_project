@@ -21,6 +21,8 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 option(MQ_BUILD_TESTS "Build the unit tests" ON)
 option(MQ_ENABLE_ASAN "Build with AddressSanitizer" OFF)
+# 默认关闭，保证没有安装 ROS2 的机器仍能构建 broker。
+option(MQ_BUILD_ROS2_BRIDGE "Build mq_bridge with ROS2/rclcpp support" OFF)
 
 # ---------------------------------------------------------------------------
 # Third-party dependencies
@@ -46,6 +48,11 @@ endforeach()
 protobuf_generate_cpp(MQ_PROTO_SRCS MQ_PROTO_HDRS
     proto/mq_msg.proto
     proto/mq_proto.proto)
+
+# bridge 自己的协议和配置消息，不进入 broker 的协议依赖。
+protobuf_generate_cpp(BRIDGE_PROTO_SRCS BRIDGE_PROTO_HDRS
+    proto/bridge_config.proto
+    proto/bridge_envelope.proto)
 
 # ---------------------------------------------------------------------------
 # mq_core: protobuf messages + muduo protobuf codec + common headers
@@ -77,10 +84,46 @@ if(MQ_ENABLE_ASAN)
 endif()
 
 # ---------------------------------------------------------------------------
+# mq_bridge_core: config, envelope, QoS mapping, retained store, adapters
+# ---------------------------------------------------------------------------
+# 这个库始终构建，因此 MQ 侧框架和单元测试不依赖 ROS2。
+# 只有打开 MQ_BUILD_ROS2_BRIDGE 时才会编译 rclcpp 适配器。
+add_library(mq_bridge_core STATIC
+    ${BRIDGE_PROTO_SRCS}
+    src/bridge/bridge_config.cc
+    src/bridge/bridge_runtime.cc
+    src/bridge/envelope_codec.cc
+    src/bridge/mq_client_adapter.cc
+    src/bridge/qos_mapper.cc
+    src/bridge/retained_store.cc
+    src/bridge/ros2_bridge.cc
+)
+
+target_include_directories(mq_bridge_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_BINARY_DIR}
+)
+
+target_link_libraries(mq_bridge_core PUBLIC mq_core)
+
+if(MQ_BUILD_ROS2_BRIDGE)
+    # ROS2 Humble 的 rclcpp 需要 C++14/17；只让 bridge 目标使用 17，
+    # broker 本身仍保持 CMakeLists 顶部的 C++11。
+    find_package(rclcpp REQUIRED)
+
+    target_compile_features(mq_bridge_core PUBLIC cxx_std_17)
+    target_compile_definitions(mq_bridge_core PUBLIC MQ_WITH_ROS2=1)
+    target_link_libraries(mq_bridge_core PUBLIC rclcpp::rclcpp)
+endif()
+
+# ---------------------------------------------------------------------------
 # Executables
 # ---------------------------------------------------------------------------
 add_executable(mqserver src/server/mq_server.cc)
 target_link_libraries(mqserver PRIVATE mq_core)
+
+add_executable(mq_bridge src/bridge/main.cc)
+target_link_libraries(mq_bridge PRIVATE mq_bridge_core)
 
 add_executable(publish_client src/client/publish_client.cc)
 target_link_libraries(publish_client PRIVATE mq_core)
@@ -121,4 +164,19 @@ if(MQ_BUILD_TESTS)
                 -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/test-run/${test_name}
                 -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/RunTest.cmake)
     endforeach()
+
+    add_executable(mq_bridge_coretest tests/mq_bridge_coretest.cpp)
+    target_link_libraries(mq_bridge_coretest PRIVATE mq_bridge_core GTest::gtest)
+    add_test(NAME mq_bridge_coretest
+        COMMAND ${CMAKE_COMMAND}
+            -DTEST_EXE=$<TARGET_FILE:mq_bridge_coretest>
+            -DDATA_DIR=${CMAKE_CURRENT_SOURCE_DIR}/tests/data
+            -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/test-run/mq_bridge_coretest
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/RunTest.cmake)
+
+    # 示例配置必须始终能通过 CLI 校验；这不依赖 ROS2 是否启用。
+    add_test(NAME mq_bridge_config_check
+        COMMAND $<TARGET_FILE:mq_bridge>
+            --config ${CMAKE_CURRENT_SOURCE_DIR}/config/bridge.conf.example
+            --check-config)
 endif()

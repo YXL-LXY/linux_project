@@ -107,8 +107,12 @@ namespace mq
         {
             if (conn->connected())
             {
-                _latch.countDown(); // 唤醒主线程中的阻塞
+                // 必须先赋值再唤醒：_latch.countDown() 提供 happens-before
+                // 同步，保证构造函数返回时主线程一定能看到 _conn。
+                // 反过来写时，构造函数可能在赋值执行前就返回，
+                // openChannel() 会拿着空的 TcpConnectionPtr 去发请求。
                 _conn = conn;
+                _latch.countDown(); // 唤醒主线程中的阻塞
             }
             else
             {

@@ -239,8 +239,12 @@ namespace mq
                 // 必须先 inc 再调用 callback：callback 内部可能同步触发 ACK/Reject，
                 // 这样计数不会出现“先减后加”的负数窗口。
                 cp->incUnacked();
-                cp->callback(cp->tag, mp->mutable_payload()->mutable_properties(),
-                             mp->payload().body());
+                // 回调里拿到的 properties/body 必须是快照拷贝：
+                // callback 执行期间该消息可能被 ACK/discard/重投修改
+                // （protobuf 对象是共享的），直接传 mutable 指针存在数据竞争。
+                BasicProperties props = mp->payload().properties();
+                std::string body = mp->payload().body();
+                cp->callback(cp->tag, &props, body);
 
                 if (cp->auto_ack)
                 {

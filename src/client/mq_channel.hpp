@@ -37,7 +37,28 @@ namespace mq
         using ptr = std::shared_ptr<Channel>;
         Channel(const muduo::net::TcpConnectionPtr &conn, const ProtobufCodecPtr &codec) : _cid(UUIDHelper::uuid()), _conn(conn), _codec(codec) {}
         // 析构时尽力取消订阅，让 broker 归还 wait-ack 消息。
-        ~Channel() { basicCancel(); }
+        ~Channel()
+        {
+            // 析构路径不能同步等待响应：走到析构往往意味着连接即将断开
+            // 或依赖本对象的所有线程正在回收，阻塞 5 秒只会拖慢关闭流程。
+            // 这里只做“尽力而为”——连接还活着就把 cancel 请求发出去
+            // （不等响应，broker 收到后会自行归还 wait-ack 消息），随后
+            // 清理本地订阅者。
+            Consumer::ptr consumer;
+            {
+                std::unique_lock<std::mutex> lock(_consumer_mutex);
+                consumer = _consumer;
+                _consumer.reset();
+            }
+            if (consumer.get() == nullptr)
+            {
+                return;
+            }
+            if (_conn && _conn->connected())
+            {
+                sendCancelRequest(*consumer);
+            }
+        }
         std::string cid() { return _cid; }
         bool openChannel()
         {
@@ -249,13 +270,7 @@ namespace mq
             {
                 return;
             }
-            std::string rid = UUIDHelper::uuid();
-            basicCancelRequest req;
-            req.set_rid(rid);
-            req.set_cid(_cid);
-            req.set_queue_name(consumer->qname);
-            req.set_consumer_tag(consumer->tag);
-            _codec->send(_conn, req);
+            std::string rid = sendCancelRequest(*consumer);
             waitResponseOk(rid, "取消订阅");
             {
                 std::unique_lock<std::mutex> lock(_consumer_mutex);
@@ -296,8 +311,18 @@ namespace mq
             if (waitResponseOk(rid, "订阅队列") == false)
             {
                 DLOG("添加订阅失败或等待响应超时！");
-                std::unique_lock<std::mutex> lock(_consumer_mutex);
-                _consumer.reset();
+                Consumer::ptr consumer;
+                {
+                    std::unique_lock<std::mutex> lock(_consumer_mutex);
+                    consumer = _consumer;
+                    _consumer.reset();
+                }
+                // 响应超时不代表服务端没有接受订阅（响应可能丢了）。
+                // 尽力补发一条 cancel 清理服务端状态，发完不等响应。
+                if (consumer.get() != nullptr && _conn && _conn->connected())
+                {
+                    sendCancelRequest(*consumer);
+                }
                 return false;
             }
             return true;
@@ -334,6 +359,20 @@ namespace mq
         }
 
     private:
+        // 发出取消订阅请求但不等待响应，返回本次请求的 rid。
+        // normal 的 basicCancel() 拿 rid 继续等响应；析构和清理路径只发送。
+        std::string sendCancelRequest(const Consumer &consumer)
+        {
+            std::string rid = UUIDHelper::uuid();
+            basicCancelRequest req;
+            req.set_rid(rid);
+            req.set_cid(_cid);
+            req.set_queue_name(consumer.qname);
+            req.set_consumer_tag(consumer.tag);
+            _codec->send(_conn, req);
+            return rid;
+        }
+
         // 等待响应并检查服务端返回的 ok 字段；超时会记录日志并返回 false。
         bool waitResponseOk(const std::string &rid, const char *action)
         {

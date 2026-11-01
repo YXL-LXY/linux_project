@@ -1,5 +1,7 @@
 #include "mq_connection.hpp"
 #include <cstdlib>
+#include <thread>
+#include <chrono>
 
 void cb(mq::Channel::ptr &channel, const std::string consumer_tag, 
     const mq::BasicProperties *bp, const std::string &body)

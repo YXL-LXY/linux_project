@@ -44,6 +44,12 @@ namespace mq
             for (auto &str : sub_args)
             {
                 size_t pos = str.find("=");
+                // 与 MsgQueue::setArgs 保持一致：没有 "=" 的片段直接忽略，
+                // 避免 npos 截断把整段既当 key 又当 value。
+                if (pos == std::string::npos)
+                {
+                    continue;
+                }
                 std::string key = str.substr(0, pos);
                 std::string val = str.substr(pos + 1);
                 args[key] = val;
@@ -69,7 +75,11 @@ namespace mq
         {
             std::string path = FileHelper::parentDirectory(dbfile);
             FileHelper::createDirectory(path);
-            assert(_sql_helper.open());
+            if (_sql_helper.open() == false)
+            {
+                ELOG("打开交换机元数据库 %s 失败!", dbfile.c_str());
+                abort();
+            }
             createTable();
         }
         void createTable()

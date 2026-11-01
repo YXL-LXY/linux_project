@@ -49,7 +49,12 @@ namespace mq
             sql << "exchange_name varchar(32), ";
             sql << "msgqueue_name varchar(32), ";
             sql << "binding_key varchar(128));";
-            assert(_sql_helper.exec(sql.str(), nullptr, nullptr));
+            // Release 构建下 assert 会失效；建表失败必须显式终止。
+            if (_sql_helper.exec(sql.str(), nullptr, nullptr) == false)
+            {
+                ELOG("创建 binding_table 失败，broker 无法启动!");
+                abort();
+            }
         }
         void removeTable()
         {
@@ -129,9 +134,23 @@ namespace mq
             // 加锁，构造一个队列的绑定信息对象， 添加映射关系
             std::unique_lock<std::mutex> lock(_mutex);
             auto it = _bindings.find(ename);
-            if (it != _bindings.end() && it->second.find(qname) != it->second.end())
+            if (it != _bindings.end())
             {
-                return true;
+                auto qit = it->second.find(qname);
+                if (qit != it->second.end())
+                {
+                    // 同一对 (exchange, queue) 只允许一个 binding key：
+                    // - key 相同：视为重复声明，幂等成功；
+                    // - key 不同：显式失败。旧实现静默保留旧 key 但返回成功，
+                    //   客户端会以为新 key 已生效，路由行为不可预期。
+                    if (qit->second->binding_key != key)
+                    {
+                        DLOG("绑定失败：exchange=%s queue=%s 已存在不同 binding key",
+                             ename.c_str(), qname.c_str());
+                        return false;
+                    }
+                    return true;
+                }
             }
             // 绑定信息是否需要持久化，取决于什么？ 交换机数据是持久化的，以及队列数据也是持久化的。
             Binding::ptr bp = std::make_shared<Binding>(ename, qname, key);

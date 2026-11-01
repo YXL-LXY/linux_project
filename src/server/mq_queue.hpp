@@ -205,7 +205,13 @@ namespace mq
             sql << "exclusive int, ";
             sql << "auto_delete int, ";
             sql << "args varchar(128));";
-            assert(_sql_helper.exec(sql.str(), nullptr, nullptr));
+            // Release 构建下 assert 会失效；建表失败必须显式终止，
+            // 否则所有队列元数据都会静默丢失。
+            if (_sql_helper.exec(sql.str(), nullptr, nullptr) == false)
+            {
+                ELOG("创建 queue_table 失败，broker 无法启动!");
+                abort();
+            }
         }
         void removeTable()
         {

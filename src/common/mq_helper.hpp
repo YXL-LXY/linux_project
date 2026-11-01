@@ -95,8 +95,7 @@ namespace mq
     public:
         static std::string uuid()
         {
-            std::random_device rd;
-            std::mt19937_64 gernator(rd());
+            static thread_local std::mt19937_64 gernator(std::random_device{}());
             std::uniform_int_distribution<int> distribution(0, 255);
             std::stringstream ss;
             for (int i = 0; i < 8; i++)
@@ -249,10 +248,16 @@ namespace mq
             }
             return true;
         }
+        // 删除目录及其全部内容。底层走 system("rm -rf")，路径来自调用方，
+        // 这里先拒绝会改变命令语义的特殊字符（空格、引号、管道、分号等），
+        // 否则 "dir;reboot" 这类路径会在 shell 里被拆成两条命令执行。
         static bool removeDirectory(const std::string &path)
         {
-            // rm -rf path
-            // system()
+            const std::string danger = " ;|&<>'\"`$\\*\?!#~";
+            if (path.empty() || path.find_first_of(danger) != std::string::npos)
+            {
+                return false;
+            }
             std::string cmd = "rm -rf " + path;
             return (system(cmd.c_str()) != -1);
         }

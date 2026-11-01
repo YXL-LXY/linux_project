@@ -55,7 +55,13 @@ namespace mq
             _tmpfile = basedir + qname + TMPFILE_SUBFIX;
             if (FileHelper(basedir).exists() == false)
             {
-                assert(FileHelper::createDirectory(basedir));
+                if (FileHelper::createDirectory(basedir) == false)
+                {
+                    // 目录创建失败意味着该队列后续所有持久化读写都会失败。
+                    // Release 构建下 assert 会失效，这里必须显式终止。
+                    ELOG("创建队列数据目录 %s 失败，无法启动持久化!", basedir.c_str());
+                    abort();
+                }
             }
             createMsgFile();
         }
@@ -116,53 +122,51 @@ namespace mq
             msg->mutable_payload()->set_valid("0");
             return true;
         }
-        std::list<MessagePtr> gc()
+        // 垃圾回收：把有效记录重写到 .mqd.tmp，再原子替换 .mqd。
+        //
+        // 只有全部步骤成功才返回 true 并把恢复出的消息列表写入 result；
+        // 此时 result 中每个消息的 offset/length 已经指向新文件中的位置。
+        // 任何一步失败都返回 false（并清理 .mqd.tmp），调用方必须保持
+        // 原有计数和索引不变，否则一次失败的 GC 会把持久化状态“清零”。
+        bool gc(std::list<MessagePtr> &result)
         {
-            // 1. 加载出文件中所有的有效数据；  存储格式 4字节长度|数据|4字节长度|数据.....
-            bool ret;
-            std::list<MessagePtr> result;
-            ret = load(result);
-            if (ret == false)
+            result.clear();
+            // 1. 读取当前文件中的全部记录（含无效记录），筛选出有效数据
+            if (load(result) == false)
             {
-                DLOG("加载有效数据失败！\n");
-                return result;
+                DLOG("垃圾回收读取文件失败，本次放弃 GC: %s", _datafile.c_str());
+                result.clear();
+                return false;
             }
-            // DLOG("垃圾回收，得到有效消息数量：%d", result.size());
-            // 2. 将有效数据，进行序列化存储到临时文件中
+            // 2. 将有效数据序列化写入临时文件（此时 offset 指向 .mqd.tmp）
             FileHelper::createFile(_tmpfile);
             for (auto &msg : result)
             {
-                DLOG("向临时文件写入数据: %s", msg->payload().body().c_str());
-                ret = insert(_tmpfile, msg);
-                if (ret == false)
+                if (insert(_tmpfile, msg) == false)
                 {
-                    DLOG("向临时文件写入消息数据失败！！");
-                    return result;
+                    DLOG("垃圾回收写入临时文件失败，本次放弃 GC: %s", _tmpfile.c_str());
+                    FileHelper::removeFile(_tmpfile);
+                    result.clear();
+                    return false;
                 }
             }
-            // DLOG("垃圾回收后，向临时文件写入数据完毕，临时文件大小: %ld", FileHelper(_tmpfile).size());
-            // 3. 删除源文件
-            ret = FileHelper::removeFile(_datafile);
-            if (ret == false)
+            // 3. 删除源文件，再把临时文件改回正式名。这一步之后日志中的
+            //    offset 才真正对应 _datafile。
+            if (FileHelper::removeFile(_datafile) == false ||
+                FileHelper(_tmpfile).rename(_datafile) == false)
             {
-                DLOG("删除源文件失败！");
-                return result;
+                DLOG("垃圾回收替换文件失败，本次放弃 GC: %s", _datafile.c_str());
+                FileHelper::removeFile(_tmpfile);
+                result.clear();
+                return false;
             }
-            // 4. 修改临时文件名，为源文件名称
-            ret = FileHelper(_tmpfile).rename(_datafile);
-            if (ret == false)
-            {
-                DLOG("修改临时文件名称失败！");
-                return result;
-            }
-            // 5. 返回新的有效数据
-            return result;
+            return true;
         }
 
     private:
         bool load(std::list<MessagePtr> &result)
         {
-            // 加载出文件中所有的有效数据；  存储格式 4字节长度|数据|4字节长度|数据.....
+            // 加载出文件中所有的有效数据；  存储格式：[size_t 长度][Message::Payload 字节]...
             FileHelper data_file_helper(_datafile);
             size_t offset = 0, msg_size;
             size_t fsize = data_file_helper.size();
@@ -323,7 +327,17 @@ namespace mq
         bool recovery()
         {
             std::unique_lock<std::mutex> lock(_mutex);
-            _msgs = _mapper.gc();
+            // 恢复时先做一次 GC，把历史无效记录清掉。GC 失败时保留空状态并
+            // 返回失败：宁可让上层感知异常，也不能拿着过期的索引继续运行。
+            std::list<MessagePtr> recovered;
+            if (_mapper.gc(recovered) == false)
+            {
+                _msgs.clear();
+                _durable_msgs.clear();
+                _valid_count = _total_count = 0;
+                return false;
+            }
+            _msgs = recovered;
             for (auto &msg : _msgs)
             {
                 _durable_msgs.insert(std::make_pair(msg->payload().properties().id(), msg));
@@ -367,6 +381,18 @@ namespace mq
             // 不允许发布端伪造。
             msg->mutable_payload()->mutable_properties()->set_delivery_count(0);
             std::unique_lock<std::mutex> lock(_mutex);
+
+            // 消息 id 在 wait-ack 与持久化索引中都作为 key，重复 id 会让
+            // 两次投递互相覆盖、ACK 时错误地淘汰另一条记录。已经在队列里
+            // 的 id 直接拒绝重复发布，交给发布端换取新 id 重试。
+            const std::string &msg_id = msg->payload().properties().id();
+            if (_durable_msgs.find(msg_id) != _durable_msgs.end() ||
+                _waitack_msgs.find(msg_id) != _waitack_msgs.end())
+            {
+                DLOG("消息id %s 已存在于队列[%s]中，拒绝重复入队!", msg_id.c_str(), _qname.c_str());
+                return false;
+            }
+
             // 2. 判断消息是否需要持久化
             if (msg->payload().properties().delivery_mode() == DeliveryMode::DURABLE)
             {
@@ -408,9 +434,16 @@ namespace mq
                 deadline = mqNowMs() + ack_timeout_ms;
             }
             // 将该消息对象，向待确认的hash表中添加一份，等到收到消息确认后进行删除
-            _waitack_msgs.insert(std::make_pair(
+            bool inserted = _waitack_msgs.insert(std::make_pair(
                 msg->payload().properties().id(),
-                WaitAckEntry(msg, consumer_tag, _waitack_seq++, deadline)));
+                WaitAckEntry(msg, consumer_tag, _waitack_seq++, deadline))).second;
+            if (inserted == false)
+            {
+                // 正常流程不会到这里：insert() 已拒绝重复 id。防御性记录，
+                // 便于定位 Client 复用旧 id 的异常场景。
+                DLOG("队列[%s]中消息 id %s 重复投递，wait-ack 可能失序!",
+                     _qname.c_str(), msg->payload().properties().id().c_str());
+            }
             return msg;
         }
         // 确认消息（basicAck）。
@@ -661,7 +694,14 @@ namespace mq
             // 1. 进行垃圾回收，获取到垃圾回收后，有效的消息信息链表
             if (GCCheck() == false)
                 return;
-            std::list<MessagePtr> msgs = _mapper.gc();
+            std::list<MessagePtr> msgs;
+            if (_mapper.gc(msgs) == false)
+            {
+                // 一次失败的 GC 不能清空计数/索引，否则下次 discard 就会
+                // 操作过期的 offset。保留原状，等下次触发再重试。
+                DLOG("队列[%s] GC 失败，保留原有持久化索引", _qname.c_str());
+                return;
+            }
             for (auto &msg : msgs)
             {
                 auto it = _durable_msgs.find(msg->payload().properties().id());
@@ -738,7 +778,12 @@ namespace mq
 
             if (created)
             {
-                qmp->recovery();
+                if (qmp->recovery() == false)
+                {
+                    // 恢复失败说明 .mqd 读取异常（文件损坏/权限等）。队列仍
+                    // 会以空状态工作，这里显式暴露，避免用户误以为数据已恢复。
+                    DLOG("队列%s的历史消息恢复失败，将以空队列继续服务!", qname.c_str());
+                }
                 return;
             }
 

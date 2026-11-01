@@ -111,6 +111,13 @@ namespace mq
         // 队列的绑定与解除绑定
         void queueBind(const queueBindRequestPtr &req)
         {
+            // binding key 中的 * 和 # 是路由匹配的保留字符，出现位置不合法
+            // 会让 Router 的匹配逻辑产生错误结果，直接拒绝而不是存进数据库。
+            if (Router::isLegalBindingKey(req->binding_key()) == false)
+            {
+                DLOG("非法的 binding key: %s", req->binding_key().c_str());
+                return basicResponse(false, req->rid(), req->cid());
+            }
             bool ret = _host->bind(req->exchange_name(),
                                    req->queue_name(), req->binding_key());
             return basicResponse(ret, req->rid(), req->cid());

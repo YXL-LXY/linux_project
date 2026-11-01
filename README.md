@@ -1,357 +1,202 @@
 # mq
 
-一个用 **C++11 + muduo + protobuf** 实现的轻量级消息队列，核心模型参考 RabbitMQ：
-交换机（Exchange）、队列（Queue）、绑定（Binding）、信道（Channel）、发布/订阅与手动 ACK。
+一个用 C++11 写的小型消息队列 broker，接口和概念模仿 RabbitMQ（交换机、队列、绑定、ACK、死信、prefetch），但规模小得多，设计优先考虑可读和易学，生产功能做了取舍。网络层用 muduo，协议用 protobuf，元数据存 SQLite，队列消息存 append-only 文件。
 
-项目目标是**把消息队列的核心链路讲清楚、跑起来**，而不是做一个生产级中间件。
-当前版本适合作为 C++ 网络编程 / 后端实习项目的作品集。
+项目自带一个原型客户端库和示例程序，另有一个可选的 ROS2 桥接模块（详见下文「ROS2 bridge」）。
 
-> 完整架构、协议、并发模型、持久化和 ROS2 Bridge 说明见 [PROJECT.md](PROJECT.md)。
-> 本文档保留为快速开始和常用命令参考。
->
-> 当前 ROS2 Bridge 已接通双向数据面：`mq_bridge` 会声明 MQ 拓扑、消费队列并
-> 发布到 ROS2，也会把 ROS2 消息封装成 `BridgeEnvelope` 后发布到 MQ。仍没有
-> 自动重连、Publisher Confirm 和监控指标，详见文末“已知限制”。
+设计动机和实现细节见 [PROJECT.md](PROJECT.md)，本文只讲怎么用和会发生什么。
 
-## 架构
+## 目录
 
-```text
-┌──────────────┐        TCP + protobuf        ┌─────────────────────────────────────┐
-│ publish_client│ ───────────────────────────▶ │                mqserver              │
-└──────────────┘                              │                                     │
-                                              │  Connection / Channel               │
-┌──────────────┐        TCP + protobuf        │        │                            │
-│ consume_client│ ◀─────────────────────────── │        ▼                            │
-└──────────────┘                              │  VirtualHost                        │
-                                              │   ├── ExchangeManager  (交换机)      │
-                                              │   ├── MsgQueueManager  (队列元数据)  │
-                                              │   ├── BindingManager   (绑定关系)    │
-                                              │   └── MessageManager   (消息存储)    │
-                                              │          │                          │
-                                              │          ├── SQLite: data/meta.db    │
-                                              │          └── 文件:   data/*.mqd      │
-                                              └─────────────────────────────────────┘
-```
+- [快速开始](#快速开始)
+- [客户端用法](#客户端用法)
+- [核心概念](#核心概念)
+- [消息的可靠性语义](#消息的可靠性语义)
+- [持久化](#持久化)
+- [ROS2 bridge](#ros2-bridge)
+- [测试](#测试)
+- [已知限制](#已知限制)
 
-一条消息的路径：
+## 快速开始
 
-```text
-publish
-  └─▶ Exchange ──(routing key)──▶ Binding ──▶ Queue
-                                                │
-                                       QueueDispatcher
-                                                │  多个消费者轮转竞争 + prefetch 限制
-                                                ▼
-                                       consumer callback
-                                                │
-                                 basicAck / basicReject
-                                                │
-                             ACK 超时扫描 → 重投 / 死信队列
-```
+### 依赖
 
-支持三种交换机：
+- CMake >= 3.16，C++11 编译器（g++ 或 clang++ 均可）
+- protobuf、SQLite3、zlib 的开发包
+- 一个 C++ 标准库自带的 pthread；muduo 已经以静态库形式放在 `third_party/muduo/` 里，无需安装
+- ROS2（只有构建 bridge 运行模式需要；不装也能编译 broker）
 
-| 类型 | 路由规则 |
-| --- | --- |
-| `DIRECT` | routing key 与 binding key 完全相等 |
-| `FANOUT` | 忽略 routing key，投递给所有绑定队列 |
-| `TOPIC` | `*` 匹配一个单词，`#` 匹配零个或多个单词，例如 `news.music.#` |
-
-## 目录结构
-
-```text
-.
-├── CMakeLists.txt          # 顶层构建脚本
-├── cmake/
-│   └── RunTest.cmake       # 为每个测试复制独立的数据目录
-├── config/
-│   └── bridge.conf.example # ROS2 bridge 配置示例（protobuf text format）
-├── proto/
-│   ├── mq_msg.proto        # 消息、属性、交换机类型
-│   ├── mq_proto.proto      # 客户端与服务器之间的请求/响应
-│   ├── bridge_config.proto # bridge 配置、方向、QoS
-│   └── bridge_envelope.proto
-├── src/
-│   ├── common/             # 日志、文件/SQLite 工具、线程池
-│   ├── server/             # broker：连接、信道、交换机、队列、绑定、消息存储
-│   ├── client/             # 客户端库 + publish/consume 示例
-│   └── bridge/             # 独立 mq_bridge 数据面（可选 rclcpp）
-├── tests/                  # GoogleTest 单元测试 + SQLite 测试数据
-├── third_party/
-│   └── muduo/              # 预编译的 muduo 头文件与静态库（x86-64 Linux）
-├── data/                   # 运行时生成，已被 .gitignore 忽略
-└── README.md
-```
-
-## 依赖
-
-Ubuntu / Debian：
+Ubuntu 上大致是：
 
 ```bash
-sudo apt update
-sudo apt install -y \
-    build-essential cmake \
-    libprotobuf-dev protobuf-compiler \
-    libsqlite3-dev zlib1g-dev \
-    libgtest-dev
+sudo apt install build-essential cmake libprotobuf-dev protobuf-compiler \
+    libsqlite3-dev zlib1g-dev
 ```
 
-要求：
-
-- CMake >= 3.16
-- 支持 C++11 的编译器（GCC 7+ / Clang 6+）
-- protobuf >= 3.x
-- `third_party/muduo` 中自带 muduo 头文件和静态库，不需要单独安装 muduo
-- 可选：ROS2 Humble（只有 `MQ_BUILD_ROS2_BRIDGE=ON` 时需要；bridge 目标使用 C++17）
-
-> muduo 静态库目前是 **x86-64 Linux** 下编译的。如果你在 ARM 或 macOS 上构建，
-> 需要自己重新编译 muduo，并替换 `third_party/muduo/lib`。
-
-## 构建
+### 构建与运行
 
 ```bash
-cmake -S . -B build
-cmake --build build -j
+mkdir build && cmake -S . -B build && cmake --build build -j4
 ```
 
-构建产物在 `build/bin/`：
+构建产物在 `build/bin/` 下：`mqserver`（broker）、`publish_client`、`consume_client`、`mq_bridge`。
 
-```text
-build/bin/mqserver
-build/bin/publish_client
-build/bin/consume_client
-build/bin/mq_bridge
-build/bin/mq_*test
-```
-
-常用选项：
+启动 broker 并跑通最简单的发布/消费流程：
 
 ```bash
-# 不构建测试，只构建 broker 和客户端
-cmake -S . -B build -DMQ_BUILD_TESTS=OFF
-
-# 打开 AddressSanitizer（排查 use-after-free / 越界）
-cmake -S . -B build -DMQ_ENABLE_ASAN=ON
-cmake --build build -j
-
-# Release 构建
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-
-# 打开 ROS2 bridge（需要 ROS2 Humble；bridge 目标使用 C++17）
-cmake -S . -B build-ros2 \
-    -DMQ_BUILD_ROS2_BRIDGE=ON \
-    -DCMAKE_PREFIX_PATH=/opt/ros/humble
-cmake --build build-ros2 -j
-```
-
-`MQ_BUILD_ROS2_BRIDGE` 默认关闭，broker 本身始终保持 C++11 且不链接 ROS2。
-关闭时 `mq_bridge` 仍可构建，但只能做配置校验；`--run` 会提示没有 ROS2 支持。
-
-protobuf 的 `.pb.cc/.pb.h` 在构建时生成到 `build/`，不提交到仓库。
-
-## 运行
-
-准备三个终端，都在仓库根目录执行。
-
-终端 1：启动 broker（默认监听 `0.0.0.0:8085`，数据写到 `./data/`）
-
-```bash
+# 终端 1：默认数据目录 ./data/，默认端口 8085；都可以通过参数改
 ./build/bin/mqserver
-# 也可以指定数据目录和端口
-./build/bin/mqserver ./data/ 8085
-```
 
-终端 2：订阅 `queue2`
+# 终端 2：消费者先挂着
+./build/bin/consume_client queue1 consumer1
 
-```bash
-./build/bin/consume_client queue2
-```
-
-同一个队列可以启动多个消费者，用不同的 consumer tag 分摊消息：
-
-```bash
-./build/bin/consume_client queue2 consumer-A
-./build/bin/consume_client queue2 consumer-B
-```
-
-第三个可选参数是 prefetch：每个消费者最多同时持有多少条未 ACK 消息。
-
-```bash
-# 每个消费者同一时间最多处理 1 条，ACK 后才继续投递
-./build/bin/consume_client queue2 consumer-A 1
-```
-
-终端 3：发布消息
-
-```bash
+# 终端 3：发布消息
 ./build/bin/publish_client
 ```
 
-`consume_client` 会打印：
+`consume_client` 的第 3 个参数可以设置 prefetch（同一消费者最多未确认消息数），例如 `./build/bin/consume_client queue1 consumer1 1`。
 
-```text
-consumer1消费了消息：Hello World-0
-consumer1消费了消息：Hello World-1
-...
-consumer1消费了消息：Hello Bite
-```
+### 构建选项
 
-默认示例里：
-
-- `exchange1` 是 `TOPIC` 交换机
-- `queue1` 的 binding key 是 `queue1`
-- `queue2` 的 binding key 是 `news.music.#`
-- `publish_client` 使用的 routing key 是 `news.music.pop`，所以消息会进入 `queue2`
-
-## ROS2 bridge 数据面
-
-先校验配置并查看 bridge 计划：
-
-```bash
-./build/bin/mq_bridge --config config/bridge.conf.example --check-config
-```
-
-打开 ROS2 支持后启动数据面（broker 需要先运行并监听配置中的端口）：
-
-```bash
-./build-ros2/bin/mq_bridge --config config/bridge.conf.example --run
-```
-
-`--run` 会完成以下工作：
-
-- 连接 MQ broker，按配置声明 exchange、queue 和 binding；
-- 为 `MQ_TO_ROS2` 创建 generic publisher 和 MQ 消费者；
-- 为 `ROS2_TO_MQ` 创建 generic subscriber，把 CDR 封装成
-  `BridgeEnvelope` 后发布到 MQ；
-- 在启动时从 retained store 回放最近状态；
-- 用独立串行任务线程执行跨域 publish/ACK/Reject，避免阻塞 ROS2 executor。
-
-MQ → ROS2 使用手动 ACK 时，只有 ROS2 publish 成功后才 ACK；失败会
-`reject(requeue=true)`。ROS2 → MQ 当前没有 Publisher Confirm，因此只能提供
-at-most-once 的发布保证：publish 请求失败会记录日志，但无法证明消息一定
-没有进入某个队列。
-
-配置使用 protobuf text format，示例见
-[`config/bridge.conf.example`](config/bridge.conf.example)。`exchange_type`
-可选 `EXCHANGE_DIRECT`、`EXCHANGE_FANOUT`、`EXCHANGE_TOPIC`，默认后者。
-同一个 exchange 被多个 topic 引用时必须使用相同类型。
-
-## QoS、失败重投和死信
-
-`basicQos(prefetch_count)` 是信道级设置，作用于该信道上的消费者：
-
-- `0`：不限制（默认）
-- `N > 0`：消费者最多同时持有 N 条未 ACK 消息；达到上限后，`QueueDispatcher` 会跳过它，把消息投给其他还有额度的消费者
-- ACK、`basicReject` 或 ACK 超时归还名额后，队列会被重新唤醒
-
-消费端处理失败时调用：
-
-```cpp
-// 重新入队，等待再次投递
-channel->basicReject(message_id, true);
-
-// 不再重投：有死信交换机就进入死信队列，否则直接丢弃
-channel->basicReject(message_id, false);
-```
-
-队列支持这些参数：
-
-| 参数 | 含义 |
+| 选项 | 说明 |
 | --- | --- |
-| `x-max-length` | 就绪消息上限，超出时丢弃最旧的 |
-| `x-ack-timeout-ms` | 等待 ACK 的毫秒数，默认 `30000`；`0` 表示关闭超时 |
-| `x-max-delivery-count` | 最多投递次数；达到后 `requeue=true` 也会转死信；未设置表示不限制 |
-| `x-dead-letter-exchange` | 死信交换机名；未设置时拒绝/超时的消息直接丢弃 |
-| `x-dead-letter-routing-key` | 可选，死信路由 key；不设置时沿用原消息的 routing key |
+| `MQ_BUILD_TESTS`（默认 ON） | 构建 gtest 单元测试 |
+| `MQ_ENABLE_ASAN`（默认 OFF） | 打开 AddressSanitizer |
+| `MQ_BUILD_ROS2_BRIDGE`（默认 OFF） | bridge 的 ROS2 运行模式；只有该目标会用 C++17 |
 
-服务端每秒扫描一次 wait-ack。超时消息会按原投递顺序重新入队，`delivery_count` 加一；
-如果达到 `x-max-delivery-count`，则按死信交换机路由。死信消息进入目标队列后，
-`delivery_count` 会重置为 0。
+开发调试建议另开一个 ASan 构建目录：
 
-`BasicProperties.delivery_count` 会随消息一起推送给消费者，消费端可以据此判断是否已经重投过。
-当前 `delivery_count` 是运行时计数，服务重启后从 0 开始；消息本身仍会持久化。
+```bash
+cmake -S . -B build-asan -DMQ_ENABLE_ASAN=ON && cmake --build build-asan -j4
+```
 
-示例：
+## 客户端用法
+
+客户端只有一个连接类加一个信道类，同步阻塞式 API（每个请求最多等 5 秒响应）：
 
 ```cpp
+#include "mq_connection.hpp"
+
+// 1. 连接（AsyncWorker 里跑 muduo 事件循环，一条连接一个线程）
+mq::AsyncWorker::ptr worker = std::make_shared<mq::AsyncWorker>();
+mq::Connection::ptr conn = std::make_shared<mq::Connection>("127.0.0.1", 8085, worker);
+
+// 2. 打开信道。上层操作都挂在信道上，返回的 shared_ptr 在订阅期间要持有
+mq::Channel::ptr ch = conn->openChannel();
+if (!ch) { /* broker 不在线或超时 */ }
+
+// 3. 声明拓扑
 google::protobuf::Map<std::string, std::string> args;
-args["x-max-length"] = "1000";
-args["x-ack-timeout-ms"] = "5000";
-args["x-max-delivery-count"] = "3";
-args["x-dead-letter-exchange"] = "dlx";
-args["x-dead-letter-routing-key"] = "dead";
-channel->declareQueue("task_queue", true, false, false, args);
-channel->basicQos(1);
+ch->declareExchange("exchange1", mq::ExchangeType::TOPIC, true, false, args);
+ch->declareQueue("queue1", true, false, false, args);
+ch->queueBind("exchange1", "queue1", "news.music.#");
+
+// 4. 发布。第二个参数传 nullptr 时 broker 负责生成消息 id
+mq::BasicProperties props;
+props.set_id("demo-1");                  // 客户端自定义 id 时必须唯一
+props.set_delivery_mode(mq::DeliveryMode::DURABLE);
+props.set_routing_key("news.music.pop");
+ch->basicPublish("exchange1", &props, "hello");
 ```
+
+订阅是这样的：
+
+```cpp
+// 回调由客户端的线程池执行；手动 ACK 时回调返回前 ACK 已经发出，不会阻塞投递
+void on_msg(mq::Channel::ptr &ch, const std::string &tag,
+            const mq::BasicProperties *props, const std::string &body)
+{
+    // ... 处理 body ...
+    ch->basicAck(props->id());
+}
+
+auto functor = std::bind(on_msg, ch, std::placeholders::_1,
+                         std::placeholders::_2, std::placeholders::_3);
+ch->basicQos(1);                                 // 可选：限流
+ch->basicConsume("c1", "queue1", false, functor);// 第三个参数 false = 手动 ACK
+```
+
+注意几个容易踩的坑：
+
+- 同一信道同一时刻只能有一个订阅者，换队列要先 `basicCancel()`。
+- 消费失败可以 `basicReject(msg_id, /*requeue=*/true)` 归还队列，或 `false` 走死信。
+- 信道由调用方持有引用，析构时会自动向 broker 发送取消订阅（不再等待响应）。
+- 目前没有 Publisher Confirm：`basicPublish` 返回 true 只表示 broker 收到了请求并完成了路由判断，不代表消息一定已落盘、也不代表一定进了某个队列。
+
+## 核心概念
+
+交换机（exchange）、队列（queue）、绑定关系（binding）三件套和 AMQP 相同：消息发布到交换机，broker 按交换机类型和 binding key 匹配投递到队列。
+
+交换机类型只有三种，路由匹配用动态规划的编辑距离式判定实现：
+
+| 类型 | 匹配规则 |
+| --- | --- |
+| DIRECT | routing key 与 binding key 逐字节相等 |
+| FANOUT | 忽略 key，投给所有绑定队列 |
+| TOPIC | key 按 `.` 分段，`*` 一段任意、`#` 任意多段 |
+
+合法字符集（DIRECT 交换机的 key 除外，它不转义）：
+
+- **binding key** 只允许字母数字、`_`，以及分段通配符 `*`、`#`；格式错误（比如 `news.*a.foo`）会在 `queueBind` 时被服务端直接拒绝。
+- **routing key** 只允许字母数字、`_`、`.`，不能含通配符。
+
+每个 (exchange, queue) 对只允许一个 binding key。重复声明相同的 key 是幂等成功；声明不同的 key 会返回失败，需要先 `queueUnBind` 再重新绑定——这是和 RabbitMQ 多键共存语义的显式偏差，见 PROJECT.md 的取舍说明。
+
+队列支持这些参数（声明时放进 `args`，key=value 用 `&` 连接）：
+
+| 参数 | 作用 |
+| --- | --- |
+| `x-max-length` | 就绪消息条数上限，超过丢最旧 |
+| `x-ack-timeout-ms` | ACK 超时毫秒数，0 表示关闭；默认 30000 |
+| `x-dead-letter-exchange` | 死信交换机 |
+| `x-dead-letter-routing-key` | 死信时的替换 routing key，缺省沿用原 key |
+| `x-max-delivery-count` | 同一条消息最多投递次数，超过进死信 |
+
+## 消息的可靠性语义
+
+- **持久化由 `delivery_mode` 决定。** DURABLE 消息先写 `.mqd` 再入内存队列，broker 重启后恢复；不指定就是 UNDURABLE，只存在于内存中。
+- **手动 ACK 模式下消息在 wait-ack 区间持有 harness**：消费端 ACK 前，消息既不在就绪队列也不会丢；ACK 超时（默认 30 秒，队列参数可改）会自动重投。
+- **发布响应是同步语义**：broker 把请求处理完（含 DURABLE 消息写入 `.mqd`）才回复，路由到的某个队列写失败（磁盘满、消息 id 重复等）会让本次发布返回 false；交换机不匹配到任何队列时消息直接被丢弃，不会报错。依然没有 Publisher Confirm——写入不带 fsync，进程崩溃不丢、断电可能丢最后几条。
+- **Reject(`requeue=true`) 不涉及死信**，消息原样放回队首等待重新投递。
+- **Reject(`requeue=false`) 和 ACK 超时重投达到上限都会转入死信**：按队列的 `x-dead-letter-exchange` 重新发布；没配死信交换机就直接丢弃（只留日志）。死信转发时 `delivery_count` 归零，避免消息在新队列里立刻再次变成死信。
+- **`x-max-length` 淘汰最旧消息时不走死信**，直接标记无效并记日志。
+- **auto_ack 模式风险自理**：服务端发出即确认，崩溃/断线时这条消息不会重新投递。
+- **顺序不保证**：重投（消费者断线、ACK 超时、Reject requeue）把消息放回队首，竞争消费时会乱序。单消费者手动 ACK 场景下顺序基本守恒，但不做承诺。
+
+投递的吞吐上限由 dispatcher 批次大小（每队列一次最多 100 条）和消费者线程池决定；竞争消费用轮转 + prefetch 配额实现，消费者多次 ACK 后重新参与调度。
+
+## 持久化
+
+Broker 落盘的数据都放在数据目录下（默认 `./data/`，启动参数第一个是目录）：`<data_dir>/<queue>.mqd` 存队列消息，`<data_dir>/<queue>.mqd.tmp` 是 GC 时的临时文件，`meta.db` 是 SQLite 交换机/队列/绑定元数据。
+
+`.mqd` 是 append-only 的 protobuf 消息序列，每条前面是平台的 `size_t` 长度前缀。文件内部没有索引，offset 全部保存在内存里，启动时重放整个文件来重建。写入不做 fsync：进程崩溃数据都在页缓存里不丢，断电可能丢最后几条——这正是没有 Publisher Confirm 的语义边界。
+
+删除消息采用「无效标记 + GC 压实」策略：ACK/丢弃时服务端改写记录的 `valid` 字段为 "0"，有效记录的 offset 前移到垃圾比率高或文件超大时用一次性 GC（写临时文件 → 删旧文件 → 改名）回收空间。GC 失败时原文件和内存索引都保持原状，等下一轮再试，尽量避免因为 GC 中途失败而丢消息。
+
+## ROS2 bridge
+
+`mq_bridge` 进程可以把 MQ 话题桥接到 ROS2 话题（双向）。这个模块是可选的：
+
+- 只做配置校验或纯正 MQ 模式时不需要 ROS2：`./build/bin/mq_bridge --config config/bridge.conf.example --check-config`
+- 真正跑 ROS2 模式要用 `-DMQ_BUILD_ROS2_BRIDGE=ON` 构建，然后 `--run`。
+
+配置文件是 protobuf text format，`config/bridge.conf.example` 里有完整注释，覆盖了 MQ↔ROS2 双方向、QoS 映射、retained store 的用法。
 
 ## 测试
 
 ```bash
-ctest --test-dir build --output-on-failure
+ctest --test-dir build        # 13 个测试套件，覆盖存储、队列、路由、调度、连接、host 全流程
 ```
 
-每个测试都会在 `build/test-run/<test_name>/` 下拿到一份独立的 `tests/data` 副本，
-避免 SQLite 状态在测试之间互相污染。
-
-只跑某个测试：
-
-```bash
-ctest --test-dir build -R mq_routetest --output-on-failure
-```
-
-## 已实现
-
-- 基于 muduo 的 TCP 服务端 / 客户端，protobuf 编解码
-- `Channel` 的打开与关闭
-- `Exchange` 的声明、删除，支持 `DIRECT` / `FANOUT` / `TOPIC`
-- `Queue` 的声明、删除，支持持久化元数据
-- `Binding` 的绑定 / 解绑与 routing key 匹配
-- `basicPublish` / `basicConsume` / `basicCancel` / `basicAck` / `basicQos` / `basicReject`
-- 队列采用 RabbitMQ 式竞争消费：同一队列的多个消费者按轮转分摊消息，每条消息只投递给其中一个消费者；新消费者不会把历史消息“独占补发”一遍
-- `QueueDispatcher` 按队列合并唤醒：发布、订阅、确认、拒绝、超时后触发正常 drain；每批最多处理 100 条，剩余消息重新排队，避免大队列长期占用单工作线程
-- `basicQos` 支持 prefetch：消费者达到在途消息上限后会被跳过，ACK/拒绝/超时后恢复投递
-- 消费失败可用 `basicReject(requeue)` 重新入队或转入死信；`delivery_count` 随消息传递
-- 消费者断线或 `basicCancel` 时，未 ACK 消息按原投递顺序重新入队，等待其他/后续消费者
-- 服务端每秒扫描一次 ACK 超时；超时消息自动重投，达到 `x-max-delivery-count` 后进入死信交换机
-- 消息落盘：SQLite 保存元数据，`.mqd` 文件保存消息体
-- 未确认消息（wait-ack）与确认后回收
-- 无消费者时消息保留在队列中，不会先取出再卡在 wait-ack
-- 支持队列参数 `x-max-length`、`x-ack-timeout-ms`、`x-max-delivery-count`、`x-dead-letter-exchange`、`x-dead-letter-routing-key`；durable 队列会随元数据持久化这些参数
-- 消费者回调使用 `weak_ptr`，避免 Channel 析构后的悬空指针；调度任务持有 dispatcher 的 `shared_ptr`，线程池使用 `weak_ptr` 避免循环引用
-- 客户端请求等待响应最多 5 秒，超时返回失败而不是永久阻塞
-- 独立 `mq_bridge`：声明 MQ 拓扑、MQ → ROS2、ROS2 → MQ、retained 启动回放、串行任务线程和手动 ACK/Reject
-- GoogleTest 单元测试与 CTest 集成
+`mq_msgtest`、`mq_hosttest` 等测试会在当前目录读写 `data/`，请从项目根目录运行。CD 默认是构建目录时用 `ctest --test-dir build` 即可，无需手工 cd。
 
 ## 已知限制
 
-这些是刻意保留的边界，不是“忘了做”：
+这是一个学习/骨架项目，下面这些是有意为之的边界，不是 bug：
 
-- **没有 Publisher Confirm / mandatory / return**：发布端无法确认 broker 是否收到消息。
-- **只实现了单条 `basicReject`**：没有 `basicNack(multiple)`，也不支持批量确认；消费端需要自己记录失败消息 id。
-- **ACK 超时和死信是 at-least-once**：超时/断线都会重投，不是 exactly-once；消费端仍需要保证操作幂等。
-- **`delivery_count` 没有持久化**：它保存在消息运行时属性里，服务重启后会从 0 开始；持久化消息体会恢复，但重投次数不会。
-- **broker 没有 latched / retained 语义**：队列是“消费即出队”的工作队列，不会为每个新订阅者保留最近一条或最近 N 条副本。ROS2 latched / transient-local 的“最新状态”需求由 bridge 的 retained store 单独处理，不改变 broker 队列语义。
-- **`x-max-length` 只约束待推送消息**：已经被消费者取走但尚未 ACK 的消息不计入上限，所以消费者长期不 ACK 时，队列里的消息总量仍可能超过上限。
-- **死信配置要避免环路**：如果死信交换机又把消息路由回源队列，可能形成反复投递；当前没有死信跳数/循环检测。
-- **没有大包零拷贝 / 共享内存**：消息体统一走 protobuf 和 TCP。
-- **ROS2 bridge 没有自动重连**：broker 断开后进程会继续运行，但不会自动恢复连接和拓扑；需要重启 bridge。启动时如果 broker 不可达，客户端连接建立也没有超时，可能会阻塞；请先启动 broker。当前没有 Publisher Confirm，ROS2 → MQ 是 at-most-once。
-- **bridge 的 QoS 只是子集**：只映射 reliability/durability/history depth，deadline、liveliness、lease 等 DDS 特性没有实现；不会自动改写已有队列参数。
-- **双向配置可能回环**：ROS2 → MQ 发布到的队列如果又被同一 bridge 的 MQ → ROS2 消费，消息会循环；示例配置用不同的 routing key 和队列避免这个问题。
-- **没有监控面板**：没有 Prometheus / Grafana，只有日志。
-- **请求超时不等于请求没执行**：客户端 5 秒没收到响应会返回失败，但服务端可能已经处理了请求。
-- **没有 TLS、鉴权、权限控制**：默认只适合本地学习。
-- **muduo 是预编译静态库**：换架构需要自行重新编译。
-
-## 下一步
-
-按优先级建议继续做：
-
-1. 补 bridge 自动重连：连接断开后重新连接、恢复 consumer 和拓扑，并记录重连次数
-2. 写一个 100Hz IMU + 大包图像的 demo，并补一张吞吐/延迟表
-3. 补 bridge 集成测试：真实 broker + ROS2 pub/sub 的双向链路、retained 回放和失败重投
-4. 可选：补监控指标（队列深度、消费者数、未确认数、超时/死信计数、bridge 转发计数）
-5. 可选：补 `basicNack(multiple)`、Publisher Confirm 和更有针对性的持久化重投计数
-
-## License
-
-MIT，见 [LICENSE](LICENSE)。
+- **没有 Publisher Confirm**，客户端无法区分「broker 收到了」和「broker 持久化成功」。
+- **文件损坏时孤儿队列可能丢消息**：`.mqd` 只做长度前缀包裹，断电时写到一半的记录在恢复时按长度解析，无法校验内容完整性（无 CRC）。
+- **多种故障模式下的窗口**：broker 宕机的边界、断线期间的投递、重投与死信的时序等，没有做端到端形式化验证。
+- **系统 `system("rm -rf")` 删目录**：路径会做字符白名单过滤，但只在小规模数据目录上验证过。
+- **单 broker**，无集群、无主从、无权限控制，连接层不做认证。
+- ROS2 bridge 依赖运行时查到的 `ros2` 环境，不是纯 C++ 链接依赖，机器上没装 rclcpp 也能编译其他目标。
